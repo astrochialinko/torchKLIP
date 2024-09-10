@@ -1,2 +1,3 @@
 # torchKLIP
-Implementation of the basic KLIP algorithm using PyTorch
+
+The code will be made available shortly.
