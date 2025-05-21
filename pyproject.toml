@@ -23,6 +23,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "jupyter", "pyklip", "scikit-image"]
+docs = [
+  "sphinx>=5.0",
+  "sphinx-rtd-theme",
+  "sphinx-autodoc-typehints"
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
