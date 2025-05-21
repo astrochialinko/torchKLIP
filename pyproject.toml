@@ -26,7 +26,8 @@ dev = ["pytest", "jupyter", "pyklip", "scikit-image"]
 docs = [
   "sphinx>=5.0",
   "sphinx-rtd-theme",
-  "sphinx-autodoc-typehints"
+  "sphinx-autodoc-typehints",
+  "nbsphinx"
 ]
 
 [tool.setuptools.packages.find]
