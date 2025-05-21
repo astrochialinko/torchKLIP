@@ -1,5 +1,10 @@
 # torchKLIP
 
+[![PyPI Status](https://img.shields.io/pypi/v/torchklip.svg?logo=pypi&logoColor=white)](https://pypi.org/project/torchklip/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Documentation Status](https://img.shields.io/badge/docs-latest%20build-brightgreen?logo=read-the-docs&logoColor=white)](https://torchklip.readthedocs.io/en/latest/?badge=latest)
+[![Python 3.11](https://img.shields.io/badge/python-3.11-blue)](https://pypi.org/project/torchklip/)
+
 torchKLIP is a PyTorch implementation of the PCA-based Karhunen–Loève Image Projection (KLIP) algorithm for point spread function (PSF) subtraction in the direct imaging of exoplanets.
 
 ## Set-Up
@@ -18,7 +23,7 @@ conda activate torchklip
 Install the stable version with:
 
 ```bash
-pip install torchKLIP
+pip install torchklip
 ```
 
 ### Install from GitHub
