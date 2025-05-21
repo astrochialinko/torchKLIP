@@ -13,20 +13,20 @@ conda create -n torchklip python=3.11
 conda activate torchklip
 ```
 
+### Install from PyPI
+
+Install the stable version with:
+
+```bash
+pip install torchKLIP
+```
+
 ### Install from GitHub
 
 Install the latest code directly from the repository:
 
 ```bash
 pip install git+ssh://git@github.com/astrochialinko/torchKLIP.git
-```
-
-### Install from PyPI (future)
-
-Once we publish a release, you can install the stable version with:
-
-```bash
-pip install torchKLIP
 ```
 
 ### Development Mode
