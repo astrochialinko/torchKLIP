@@ -20,4 +20,5 @@ sphinx:
 python:
   version: 3.11
   install:
-    - pip install .[docs]
+    - path: .
+      extra_requirements: docs
