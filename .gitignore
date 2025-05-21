@@ -1,0 +1,38 @@
+# Byte-compiled / optimized / compiled Python files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# Build and distribution directories
+*.egg-info/
+
+# Logs and cache
+*.log
+.cache/
+
+# Jupyter Notebook checkpoints
+*.ipynb_checkpoints
+
+# macOS-specific files
+.DS_Store
+
+# IDE-specific files
+.vscode/
+.idea/
+
+# Pytest cache
+.pytest_cache/
+
+# Ignore all files in logs/ and data/
+logs/*
+data/*
+
+# But don’t ignore the placeholders
+!logs/.gitkeep
+!data/.gitkeep
+
+# Ignore built documentation
+docs/build/
+

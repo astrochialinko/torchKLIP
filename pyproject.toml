@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools >= 61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "torchklip"
+version = "0.1.0"
+description = "A Python package for exoplanet data processing, featuring an implementation of the fundamental KLIP algorithm using PyTorch."
+authors = [
+    { name = "Chia-Lin Ko", email = "clko@arizona.edu" }
+]
+license = { file = "LICENSE" }
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.21,<2.0", 
+    "astropy>=5.0", 
+    "matplotlib>=3.5", 
+    "scipy>=1.8", 
+    "torch>=1.13", 
+    "torchvision>=0.14"
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "jupyter", "pyklip", "scikit-image"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"

@@ -1,0 +1,9 @@
+/* Adjust the primary sidebar width */
+.bd-sidebar {
+  width: 250px; /* Change this value to your desired width */
+}
+
+/* You may also need to adjust the main content area accordingly */
+.bd-main {
+  margin-left: 20px; /* Match the width value from above */
+}
