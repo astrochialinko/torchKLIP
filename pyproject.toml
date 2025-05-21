@@ -27,7 +27,8 @@ docs = [
   "sphinx>=5.0",
   "sphinx-rtd-theme",
   "sphinx-autodoc-typehints",
-  "nbsphinx"
+  "nbsphinx",
+  "pydata_sphinx_theme"
 ]
 
 [tool.setuptools.packages.find]
