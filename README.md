@@ -93,7 +93,7 @@ To quickly test torchKLIP, follow these steps:
 
 This notebook walks through a KLIP-based PSF subtraction example using the Beta Pictoris dataset and demonstrates key features of the package.
 
-# Project Structure
+## File Structure
 
 ```
 .
@@ -130,7 +130,7 @@ This notebook walks through a KLIP-based PSF subtraction example using the Beta 
 └── tests/                           # Unit tests
 ```
 
-# Citation
+## Citation
 
 If you use torchKLIP in your research, please cite [Ko et al. (2024)](https://www.spiedigitallibrary.org/conference-proceedings-of-spie/13138/1313811/A-PyTorch-benchmark-for-high-contrast-imaging-post-processing/10.1117/12.3027407.short)
 
@@ -154,6 +154,6 @@ doi = {10.1117/12.3027407},
 URL = {https://doi.org/10.1117/12.3027407}}
 ```
 
-# Acknowledgments
+## Acknowledgments
 
 Thanks the [Code/Astro Workshop](https://semaphorep.github.io/codeastro/) for providing valuable training in the development of open-source software packages
