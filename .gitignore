@@ -7,6 +7,8 @@ __pycache__/
 
 # Build and distribution directories
 *.egg-info/
+dist/
+temp/
 
 # Logs and cache
 *.log
@@ -28,6 +30,10 @@ __pycache__/
 # Ignore all files in logs/ and data/
 logs/*
 data/*
+
+# Ignore all .jpg and .npy files in notebooks/
+notebooks/*.jpg
+notebooks/*.npy
 
 # But don’t ignore the placeholders
 !logs/.gitkeep
