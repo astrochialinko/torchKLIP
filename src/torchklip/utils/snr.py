@@ -297,4 +297,93 @@ def compute_snr(klip_image: Union[torch.Tensor, np.ndarray],
     return snr_list
 
 
-__all__ = ["compute_snr"]
+def noise_aperture_centers(
+    image_shape: Tuple[int, int],
+    planet_x: float,
+    planet_y: float,
+    fwhm: float,
+    exclude_nearest: int = 0,
+) -> List[Tuple[float, float]]:
+    """Return pixel (x, y) centres of the noise apertures for one planet.
+
+    Positions are computed using the same ring geometry as :func:`compute_snr`
+    so the circles match the actual apertures used in the SNR calculation.
+
+    Args:
+        image_shape: ``(H, W)`` shape of the 2-D image.
+        planet_x: Planet pixel column coordinate.
+        planet_y: Planet pixel row coordinate.
+        fwhm: Aperture diameter in pixels.
+        exclude_nearest: Number of apertures to skip on either side of the
+            planet aperture — must match the value passed to :func:`compute_snr`.
+
+    Returns:
+        List of ``(x, y)`` pixel positions for noise apertures only
+        (planet aperture excluded).
+    """
+    H, W = image_shape
+    cx = (W - 1) / 2.0
+    cy = (H - 1) / 2.0
+
+    r_px, pa_deg = get_r_pa(torch.Size([H, W]), planet_x, planet_y)
+    r_px = float(r_px)
+    pa_deg = float(pa_deg)
+
+    # Planet first, then noise with the same exclusion as compute_snr uses
+    all_locs = simple_aperture_locations(
+        r_px, pa_deg, fwhm, exclude_nearest=exclude_nearest, exclude_planet=False
+    )
+
+    # Skip the first entry (planet aperture); convert offsets → pixel coords
+    return [(cx + ox, cy + oy) for ox, oy in all_locs[1:]]
+
+
+def draw_apertures(
+    ax,
+    planet_x: float,
+    planet_y: float,
+    fwhm: float,
+    image_shape: Tuple[int, int],
+    color: str = "cyan",
+    exclude_nearest: int = 0,
+) -> None:
+    """Overlay planet and noise aperture circles on *ax*.
+
+    Planet aperture: solid circle.
+    Noise apertures: dashed circles, same colour, lower alpha.
+
+    Pass the same ``exclude_nearest`` value used in :func:`compute_snr` so the
+    plotted circles exactly match the apertures used in the SNR calculation.
+
+    Args:
+        ax: Matplotlib ``Axes`` object (image already plotted).
+        planet_x: Planet pixel column coordinate.
+        planet_y: Planet pixel row coordinate.
+        fwhm: Aperture diameter in pixels.
+        image_shape: ``(H, W)`` for computing noise aperture positions.
+        color: Circle edge colour (default ``"cyan"``).
+        exclude_nearest: Number of apertures to skip on either side of the
+            planet — must match the value passed to :func:`compute_snr`.
+    """
+    import matplotlib.patches as mpatches
+
+    r = fwhm / 2.0
+
+    # Planet aperture — solid
+    ax.add_patch(mpatches.Circle(
+        (planet_x, planet_y), radius=r,
+        edgecolor=color, facecolor="none", linewidth=1.5, linestyle="-",
+    ))
+
+    # Noise apertures — dashed, honouring the same exclusion as compute_snr
+    for (nx, ny) in noise_aperture_centers(
+        image_shape, planet_x, planet_y, fwhm, exclude_nearest=exclude_nearest
+    ):
+        ax.add_patch(mpatches.Circle(
+            (nx, ny), radius=r,
+            edgecolor=color, facecolor="none", linewidth=1.0,
+            linestyle="--", alpha=0.6,
+        ))
+
+
+__all__ = ["compute_snr", "noise_aperture_centers", "draw_apertures"]

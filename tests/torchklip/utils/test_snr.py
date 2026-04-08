@@ -9,7 +9,9 @@ from torchklip.utils.snr import (
     cartesian_coords,
     reduce_apertures,
     calc_snr_mawet,
-    compute_snr
+    compute_snr,
+    noise_aperture_centers,
+    draw_apertures,
 )
 
 
@@ -244,3 +246,149 @@ class TestSNRUtils:
 
             # Verify the mocked SNR value
             assert snr.item() == 7.5
+
+
+class TestNoiseApertureCenters:
+    """Tests for noise_aperture_centers."""
+
+    IMAGE_SHAPE = (101, 101)
+    PLANET_X = 70.0
+    PLANET_Y = 50.0
+    FWHM = 5.0
+
+    def _centers(self, **kwargs):
+        kw = dict(image_shape=self.IMAGE_SHAPE, planet_x=self.PLANET_X,
+                  planet_y=self.PLANET_Y, fwhm=self.FWHM)
+        kw.update(kwargs)
+        return noise_aperture_centers(**kw)
+
+    def test_returns_list_of_tuples(self):
+        centers = self._centers()
+        assert isinstance(centers, list)
+        assert len(centers) > 0
+        assert all(len(c) == 2 for c in centers)
+
+    def test_planet_not_in_noise_list(self):
+        """Planet aperture must not appear among the noise apertures."""
+        centers = self._centers()
+        for (x, y) in centers:
+            dist = ((x - self.PLANET_X) ** 2 + (y - self.PLANET_Y) ** 2) ** 0.5
+            assert dist > self.FWHM * 0.5, "Planet aperture must not appear in noise list"
+
+    def test_count_equals_ring_minus_one(self):
+        """Noise aperture count is total ring apertures minus the planet."""
+        centers = self._centers()
+        r_px, pa_deg = get_r_pa(torch.Size(list(self.IMAGE_SHAPE)),
+                                 self.PLANET_X, self.PLANET_Y)
+        all_locs = simple_aperture_locations(
+            float(r_px), float(pa_deg), self.FWHM, exclude_planet=False
+        )
+        assert len(centers) == len(all_locs) - 1
+
+    def test_exclude_nearest_reduces_count(self):
+        """exclude_nearest=N removes 2*N apertures from the noise list."""
+        n = 2
+        centers_all = self._centers(exclude_nearest=0)
+        centers_exc = self._centers(exclude_nearest=n)
+        assert len(centers_exc) == len(centers_all) - 2 * n
+
+    def test_exclude_nearest_matches_compute_snr_geometry(self):
+        """Returned positions must agree with what simple_aperture_locations produces."""
+        n = 2
+        centers = self._centers(exclude_nearest=n)
+        r_px, pa_deg = get_r_pa(torch.Size(list(self.IMAGE_SHAPE)),
+                                 self.PLANET_X, self.PLANET_Y)
+        expected_locs = simple_aperture_locations(
+            float(r_px), float(pa_deg), self.FWHM,
+            exclude_nearest=n, exclude_planet=False,
+        )
+        # expected_locs[0] is planet; rest are noise
+        assert len(centers) == len(expected_locs) - 1
+
+    def test_pixel_coords_within_image(self):
+        """All returned positions should lie within the image bounds."""
+        H, W = self.IMAGE_SHAPE
+        for (x, y) in self._centers():
+            assert 0 <= x < W
+            assert 0 <= y < H
+
+
+class TestDrawApertures:
+    """Tests for draw_apertures."""
+
+    IMAGE_SHAPE = (101, 101)
+    PLANET_X = 70.0
+    PLANET_Y = 50.0
+    FWHM = 5.0
+
+    def setup_method(self):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        self.plt = plt
+
+    def test_adds_correct_number_of_patches(self):
+        fig, ax = self.plt.subplots()
+        n_before = len(ax.patches)
+        draw_apertures(ax, self.PLANET_X, self.PLANET_Y, self.FWHM,
+                       self.IMAGE_SHAPE, color="cyan")
+        n_noise = len(noise_aperture_centers(
+            self.IMAGE_SHAPE, self.PLANET_X, self.PLANET_Y, self.FWHM))
+        assert len(ax.patches) - n_before == 1 + n_noise
+        self.plt.close(fig)
+
+    def test_exclude_nearest_reduces_patches(self):
+        """Patches added with exclude_nearest=2 should be fewer than without."""
+        fig1, ax1 = self.plt.subplots()
+        draw_apertures(ax1, self.PLANET_X, self.PLANET_Y, self.FWHM,
+                       self.IMAGE_SHAPE, exclude_nearest=0)
+        n_full = len(ax1.patches)
+        self.plt.close(fig1)
+
+        fig2, ax2 = self.plt.subplots()
+        draw_apertures(ax2, self.PLANET_X, self.PLANET_Y, self.FWHM,
+                       self.IMAGE_SHAPE, exclude_nearest=2)
+        n_exc = len(ax2.patches)
+        self.plt.close(fig2)
+
+        # 2 excluded on each side → 4 fewer noise patches
+        assert n_full - n_exc == 4
+
+    def test_planet_patch_is_solid(self):
+        """First patch added should be the solid planet aperture."""
+        fig, ax = self.plt.subplots()
+        draw_apertures(ax, self.PLANET_X, self.PLANET_Y, self.FWHM,
+                       self.IMAGE_SHAPE, color="red")
+        planet_patch = ax.patches[0]
+        assert planet_patch.get_linestyle() == "-"
+        assert planet_patch.get_linewidth() == pytest.approx(1.5)
+        self.plt.close(fig)
+
+    def test_noise_patches_are_dashed(self):
+        """All patches after the first should be dashed noise apertures."""
+        fig, ax = self.plt.subplots()
+        draw_apertures(ax, self.PLANET_X, self.PLANET_Y, self.FWHM,
+                       self.IMAGE_SHAPE, color="cyan")
+        for patch in ax.patches[1:]:
+            assert patch.get_linestyle() == "--"
+        self.plt.close(fig)
+
+    def test_custom_color_applied(self):
+        """Edge colour (RGB) of every patch should match the requested colour."""
+        fig, ax = self.plt.subplots()
+        import matplotlib.colors as mcolors
+        draw_apertures(ax, self.PLANET_X, self.PLANET_Y, self.FWHM,
+                       self.IMAGE_SHAPE, color="magenta")
+        expected_rgb = mcolors.to_rgb("magenta")
+        for patch in ax.patches:
+            # get_edgecolor returns RGBA; compare only the RGB components
+            assert patch.get_edgecolor()[:3] == pytest.approx(expected_rgb, abs=1e-3)
+        self.plt.close(fig)
+
+    def test_radius_equals_fwhm_over_two(self):
+        fig, ax = self.plt.subplots()
+        draw_apertures(ax, self.PLANET_X, self.PLANET_Y, self.FWHM,
+                       self.IMAGE_SHAPE)
+        for patch in ax.patches:
+            assert patch.radius == pytest.approx(self.FWHM / 2.0)
+        self.plt.close(fig)
