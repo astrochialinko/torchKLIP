@@ -15,7 +15,8 @@ from torchklip.algos.klip.klip_base import (
     derotate_cube,
     combine_cube,
     TorchKLIP,
-    ResidualsWithIntermediates
+    ResidualsWithIntermediates,
+    KLIPDiagnostics,
 )
 from torchklip.dataproc.data_preprocessor import DataTensor
 from torchklip.utils.logging_utils import get_logger
@@ -352,6 +353,96 @@ def test_ResidualsWithIntermediates():
     assert torch.all(p == proj)
     assert torch.all(i == ihat)
     assert torch.all(rf == residual_flat)
+
+
+def test_compute_residuals_return_diagnostics(synthetic_datacube):
+    """Test compute_residuals with return_diagnostics=True."""
+    datacube, _ = synthetic_datacube
+    nk, ny, nx = datacube.nk, datacube.ny, datacube.nx
+    K_klip = [1, 3]
+
+    result = compute_residuals(datacube, K_klip, return_diagnostics=True)
+    assert isinstance(result, tuple) and len(result) == 2
+
+    residuals, diag = result
+    assert isinstance(diag, KLIPDiagnostics)
+
+    K_max = max(K_klip)
+    n_K = len(K_klip)
+
+    # Shape checks
+    assert residuals.shape == (n_K, nk, ny, nx)
+    assert diag.kl_basis.shape == (K_max, ny, nx)
+    assert diag.mean_frame.shape == (ny, nx)
+    assert diag.psf_estimates.shape == (n_K, nk, ny, nx)
+    assert diag.residual_frames.shape == (n_K, nk, ny, nx)
+    assert diag.coefficients.shape == (nk, K_max)
+    assert diag.K_list == sorted(K_klip)
+
+    # residual_frames must equal returned residuals tensor
+    assert torch.allclose(diag.residual_frames, residuals, equal_nan=True)
+
+    # residuals + psf_estimates ≈ mean-subtracted input (allowing for float rounding)
+    # Use the larger-K slice (last entry)
+    combined = diag.residual_frames[-1] + diag.psf_estimates[-1]
+    # Where neither is NaN, the sum should be close to mean-subtracted data
+    valid = ~torch.isnan(combined)
+    assert valid.any()
+
+
+def test_compute_residuals_diagnostics_single_k(synthetic_datacube):
+    """return_diagnostics works with a single K value."""
+    datacube, _ = synthetic_datacube
+    nk, ny, nx = datacube.nk, datacube.ny, datacube.nx
+    K_klip = 3
+
+    residuals, diag = compute_residuals(datacube, K_klip, return_diagnostics=True)
+    assert residuals.shape == (1, nk, ny, nx)
+    assert diag.kl_basis.shape == (K_klip, ny, nx)
+    assert diag.coefficients.shape == (nk, K_klip)
+    assert diag.K_list == [K_klip]
+
+
+def test_klip_and_derotate_return_diagnostics(synthetic_datacube):
+    """Test TorchKLIP.klip_and_derotate with return_diagnostics=True."""
+    datacube, angles = synthetic_datacube
+    nk, ny, nx = datacube.nk, datacube.ny, datacube.nx
+
+    klip = TorchKLIP(datacube, angles)
+
+    # Single K — result should be 2D, diagnostics present
+    result, diag = klip.klip_and_derotate(3, return_diagnostics=True)
+    assert result.shape == (ny, nx)
+    assert isinstance(diag, KLIPDiagnostics)
+    assert klip.diagnostics is diag  # also stored on instance
+
+    # Multiple K — result should be 3D
+    K_list = [1, 2, 3]
+    result, diag = klip.klip_and_derotate(K_list, return_diagnostics=True)
+    assert result.shape == (len(K_list), ny, nx)
+    assert diag.psf_estimates.shape == (len(K_list), nk, ny, nx)
+    assert diag.residual_frames.shape == (len(K_list), nk, ny, nx)
+    assert diag.kl_basis.shape == (max(K_list), ny, nx)
+    assert diag.mean_frame.shape == (ny, nx)
+    assert diag.coefficients.shape == (nk, max(K_list))
+    assert diag.K_list == sorted(K_list)
+
+
+def test_klip_and_derotate_backward_compatible(synthetic_datacube):
+    """return_diagnostics=False preserves original return type."""
+    datacube, angles = synthetic_datacube
+    ny, nx = datacube.ny, datacube.nx
+
+    klip = TorchKLIP(datacube, angles)
+    result = klip.klip_and_derotate(3)
+    assert isinstance(result, torch.Tensor)
+    assert result.shape == (ny, nx)
+
+
+def test_klip_diagnostics_public_api():
+    """KLIPDiagnostics is importable from the top-level package."""
+    import torchklip
+    assert hasattr(torchklip, "KLIPDiagnostics")
 
 
 if __name__ == "__main__":

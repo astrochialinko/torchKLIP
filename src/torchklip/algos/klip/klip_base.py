@@ -52,6 +52,38 @@ class ResidualsWithIntermediates:
         yield self.residual_flat
 
 
+@dataclass
+class KLIPDiagnostics:
+    """Diagnostic arrays from KLIP PSF subtraction.
+
+    All spatial arrays are returned in image shape ``(ny, nx)`` rather than
+    flattened, making them directly plottable.
+
+    Attributes:
+        kl_basis: KL-mode eigenimages of shape ``(K_max, ny, nx)``.
+            ``kl_basis[i]`` is the (i+1)-th KL mode image.
+        mean_frame: Temporal mean of the input datacube, shape ``(ny, nx)``.
+            This is the average frame over all exposures before KLIP subtraction
+            and represents the common stellar PSF structure.
+        psf_estimates: Reconstructed stellar PSF per K value,
+            shape ``(n_K, nk, ny, nx)``.  ``psf_estimates[i]`` is the PSF
+            model built from ``K_list[i]`` KL modes for every input frame.
+        residual_frames: Pre-collapse PSF-subtracted frames per K value,
+            shape ``(n_K, nk, ny, nx)``.  These are the residuals before
+            derotation and temporal combination.
+        coefficients: Projection weights of each frame onto all ``K_max`` KL
+            modes, shape ``(nk, K_max)``.  Slice ``coefficients[:, :k]`` to
+            retrieve weights for a specific ``k``.
+        K_list: Sorted list of K values used in this run.
+    """
+    kl_basis: torch.Tensor        # (K_max, ny, nx)
+    mean_frame: torch.Tensor      # (ny, nx)
+    psf_estimates: torch.Tensor   # (n_K, nk, ny, nx)
+    residual_frames: torch.Tensor # (n_K, nk, ny, nx)
+    coefficients: torch.Tensor    # (nk, K_max)
+    K_list: List[int]
+
+
 def _normalize_and_validate_K(K_klip: Union[int, List[int]], nk: int, logger) -> List[int]:
     """Normalizes K_klip to a sorted list of positive integers <= nk with validation.
 
@@ -103,8 +135,11 @@ def _normalize_and_validate_K(K_klip: Union[int, List[int]], nk: int, logger) ->
 def compute_residuals(datacube: DataTensor,
                       K_klip: Union[int, List[int]],
                       method: str = "svd",
-                      store_intermediates: bool = False
-                      ) -> Union[torch.Tensor, ResidualsWithIntermediates]:
+                      store_intermediates: bool = False,
+                      return_diagnostics: bool = False,
+                      ) -> Union[torch.Tensor,
+                                 ResidualsWithIntermediates,
+                                 Tuple[torch.Tensor, "KLIPDiagnostics"]]:
     """
     Compute PSF-subtracted residual cube for given KL modes.
 
@@ -116,13 +151,19 @@ def compute_residuals(datacube: DataTensor,
         datacube: DataTensor containing the input frames.
         K_klip: Integer or list of integers specifying KL mode counts.
         method: Basis computation method, one of 'svd', 'pca', or 'eigh'.
-        store_intermediates: If True, return intermediates in a ResidualsWithIntermediates.
+        store_intermediates: If True, return flat intermediate arrays in a
+            :class:`ResidualsWithIntermediates` (only for K_max).
+            Ignored when ``return_diagnostics=True``.
+        return_diagnostics: If True, return a ``(residuals, KLIPDiagnostics)``
+            tuple containing image-shaped diagnostic arrays for every K value.
+            Takes precedence over ``store_intermediates``.
 
     Returns:
-        If store_intermediates is False, returns a Tensor of shape
-        (n_k_values, nk, ny, nx) containing residuals.
-        If store_intermediates is True, returns a ResidualsWithIntermediates
-        with attributes (residuals, Z_KL, proj, ihat, residual_flat).
+        * Default (both flags False): Tensor of shape ``(n_k_values, nk, ny, nx)``.
+        * ``store_intermediates=True``: :class:`ResidualsWithIntermediates` with
+          attributes ``(residuals, Z_KL, proj, ihat, residual_flat)``.
+        * ``return_diagnostics=True``: ``(residuals, KLIPDiagnostics)`` where
+          *residuals* has shape ``(n_k_values, nk, ny, nx)``.
 
     Raises:
         ValueError: If K_klip list is empty, contains non-positive integers,
@@ -136,6 +177,10 @@ def compute_residuals(datacube: DataTensor,
     # Normalize and validate K_klip
     K_list = _normalize_and_validate_K(K_klip, nk, logger)
     K_max = K_list[-1]
+
+    # Capture temporal mean BEFORE in-place mean subtraction
+    if return_diagnostics:
+        mean_frame = torch.nanmean(datacube.tensor, dim=0)  # (ny, nx)
 
     # Prepare data: mean‐subtract and replace NaNs
     logger.debug("Mean-subtracting datacube and replacing NaNs")
@@ -157,6 +202,9 @@ def compute_residuals(datacube: DataTensor,
 
     # Always compute a 4D tensor for residuals (n_k_values, nk, ny, nx)
     residuals = torch.zeros(len(K_list), nk, ny, nx, device=data.device)
+    if return_diagnostics:
+        psf_estimates = torch.zeros(len(K_list), nk, ny, nx, device=data.device)
+    coefficients_max: Optional[torch.Tensor] = None
 
     # Compute residuals for each K value
     for i, k in enumerate(K_list):
@@ -168,11 +216,17 @@ def compute_residuals(datacube: DataTensor,
         residual_flat_k = ref_flat - ihat_k  # shape: (nk, ny*nx)
         residuals[i] = residual_flat_k.view(nk, ny, nx)
 
+        if return_diagnostics:
+            psf_estimates[i] = ihat_k.view(nk, ny, nx)
+
         # Store intermediates for max K if requested
         if store_intermediates and k == K_max:
             proj_max = proj_k
             ihat_max = ihat_k
             residual_flat_max = residual_flat_k
+
+        # Track full-K_max coefficients (last iteration = K_max since K_list is sorted)
+        coefficients_max = proj_k
 
     # Restore NaNs from original
     # shape: (1, nk, ny, nx) broadcast to (n_k_values, nk, ny, nx)
@@ -181,7 +235,20 @@ def compute_residuals(datacube: DataTensor,
     residuals = residuals.masked_fill(nan_mask, float("nan"))
 
     logger.info("Finished compute_residuals")
-    # Return intermediates results if requested
+
+    # return_diagnostics takes precedence
+    if return_diagnostics:
+        psf_estimates = psf_estimates.masked_fill(nan_mask, float("nan"))
+        diag = KLIPDiagnostics(
+            kl_basis=Z_KL.T.view(K_max, ny, nx),   # (K_max, ny, nx)
+            mean_frame=mean_frame,                   # (ny, nx)
+            psf_estimates=psf_estimates,             # (n_K, nk, ny, nx)
+            residual_frames=residuals,               # (n_K, nk, ny, nx)
+            coefficients=coefficients_max,           # (nk, K_max)
+            K_list=K_list,
+        )
+        return residuals, diag
+
     if store_intermediates:
         return ResidualsWithIntermediates(
             residuals, Z_KL, proj_max, ihat_max, residual_flat_max
@@ -397,7 +464,10 @@ class TorchKLIP:
                           method: str = "svd",
                           statistic: str = "mean",
                           isbatch: bool = True,
-                          mode: str = "adi") -> torch.Tensor:
+                          mode: str = "adi",
+                          return_diagnostics: bool = False,
+                          ) -> Union[torch.Tensor,
+                                     Tuple[torch.Tensor, KLIPDiagnostics]]:
         """
         Perform KLIP PSF subtraction, derotation, and combination.
 
@@ -406,15 +476,30 @@ class TorchKLIP:
         derotated frames.
 
         Args:
-            K_klip: Number of KL modes to use (integer or list of integers)
-            method: Method for computing basis ("svd", "pca", or "eigh")
-            statistic: Statistic for combining frames ("mean" or "median")
-            isbatch: Whether to use batch rotation
-            mode: Processing mode ("adi" only supported currently)
+            K_klip: Number of KL modes to use (integer or list of integers).
+            method: Method for computing basis ("svd", "pca", or "eigh").
+            statistic: Statistic for combining frames ("mean" or "median").
+            isbatch: Whether to use batch rotation.
+            mode: Processing mode ("adi" only supported currently).
+            return_diagnostics: If True, return a ``(result, KLIPDiagnostics)``
+                tuple instead of just ``result``.  The :class:`KLIPDiagnostics`
+                object contains the following image-shaped arrays:
+
+                * ``kl_basis`` – KL-mode eigenimages ``(K_max, ny, nx)``
+                * ``mean_frame`` – temporal mean before subtraction ``(ny, nx)``
+                * ``psf_estimates`` – reconstructed PSF per K ``(n_K, nk, ny, nx)``
+                * ``residual_frames`` – pre-collapse residuals per K ``(n_K, nk, ny, nx)``
+                * ``coefficients`` – projection weights ``(nk, K_max)``
+                * ``K_list`` – sorted list of K values used
+
+                The diagnostics are also stored as ``self.diagnostics`` for
+                convenient post-hoc access.
 
         Returns:
-            For single K_klip (integer): A 2D tensor of shape (ny, nx)
-            For multiple K_klip (list): A 3D tensor of shape (len(K_klip), ny, nx)
+            * Default: 2D tensor ``(ny, nx)`` for single K, or 3D tensor
+              ``(len(K_klip), ny, nx)`` for multiple K values.
+            * ``return_diagnostics=True``: ``(result, KLIPDiagnostics)`` where
+              *result* has the same shape as above.
         """
         # Validate processing mode
         if mode.lower() != "adi":
@@ -431,7 +516,12 @@ class TorchKLIP:
         # 1. PSF subtraction
         self.perfmon.start_timer("total")
         self.perfmon.start_timer("psfsub")
-        if self.store_intermediates:
+        if return_diagnostics:
+            residuals, diagnostics = compute_residuals(
+                self.datacube, k_list, method, return_diagnostics=True
+            )
+            self.diagnostics = diagnostics
+        elif self.store_intermediates:
             out = compute_residuals(
                 self.datacube, k_list, method, store_intermediates=True
             )
@@ -476,8 +566,11 @@ class TorchKLIP:
 
         # Only squeeze for single K value at the end
         if is_single_k:
-            return result.squeeze(0)
+            result = result.squeeze(0)
+
+        if return_diagnostics:
+            return result, self.diagnostics
         return result
 
 
-__all__ = ["TorchKLIP"]
+__all__ = ["TorchKLIP", "KLIPDiagnostics"]

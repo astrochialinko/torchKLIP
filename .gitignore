@@ -27,13 +27,20 @@ temp/
 # Pytest cache
 .pytest_cache/
 
-# Ignore all files in logs/ and data/
+# claude-specific files
+.claudeignore
+CLAUDE.md
+
+# Ignore all files in logs/, data/, and outputs/ directories
 logs/*
 data/*
+outputs/*
 
-# Ignore all .jpg and .npy files in notebooks/
+# Ignore some files in notebooks/
 notebooks/*.jpg
 notebooks/*.npy
+notebooks/outputs/*
+notebooks/betaPic.py
 
 # But don’t ignore the placeholders
 !logs/.gitkeep
