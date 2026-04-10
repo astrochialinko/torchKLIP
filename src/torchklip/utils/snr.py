@@ -1,5 +1,5 @@
 # torchklip/utils/snr.py
-from typing import Tuple, List, Callable, Union
+from typing import Tuple, List, Callable, Union, Optional
 
 import torch
 import numpy as np
@@ -11,7 +11,7 @@ from .logging_utils import get_logger
 logger = get_logger(__name__.split('.')[-1])
 
 
-def get_r_pa(image_shape: torch.Size, planet_x: float, planet_y: float) -> Tuple[float, float]:
+def get_r_pa(image_shape: torch.Size, planet_x: float, planet_y: float) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Convert pixel coordinates of a planet to polar coordinates (radius and position angle).
 
@@ -189,7 +189,8 @@ def _snr_single_frame(
     fwhm: float,
     exclude_planet: bool,
     exclude_nearest: int,
-    operation: Callable[[torch.Tensor], torch.Tensor]
+    operation: Callable[[torch.Tensor], torch.Tensor],
+    known_planets: Optional[List[Tuple[float, float]]] = None,
 ) -> torch.Tensor:
     """
     Compute SNR for a single image frame.
@@ -202,18 +203,27 @@ def _snr_single_frame(
         exclude_planet (bool): If True, exclude the planet aperture from noise.
         exclude_nearest (int): Number of nearest apertures to skip.
         operation (Callable): Reduction function for aperture values.
+        known_planets (List[Tuple[float, float]], optional): Pixel ``(x, y)``
+            centres of other known planets.  Any noise aperture whose centre
+            falls within ``(exclude_nearest + 0.5) * fwhm`` of one of these
+            positions is dropped from the noise sample, creating a keep-out
+            zone that scales automatically with ``exclude_nearest``.
 
     Returns:
         torch.Tensor: SNR value for the frame.
     """
 
-    # Get radius and angle
-    image_shape = frame.shape[-2:]
-    r_px, pa_deg = get_r_pa(image_shape, planet_x, planet_y)
+    H, W = frame.shape[-2:]
+    cx = (W - 1) / 2.0
+    cy = (H - 1) / 2.0
 
-    # Extract aperture values
+    r_px, pa_deg = get_r_pa(frame.shape[-2:], planet_x, planet_y)
+    r_px_f = float(r_px)
+    pa_deg_f = float(pa_deg)
+
+    # Extract aperture values; locations[0] is planet, [1:] are noise
     locations, results = reduce_apertures(
-        frame, r_px, pa_deg, fwhm,
+        frame, r_px_f, pa_deg_f, fwhm,
         operation=operation,
         exclude_nearest=exclude_nearest,
         exclude_planet=exclude_planet
@@ -222,10 +232,28 @@ def _snr_single_frame(
     # Planet signal is the first aperture
     planet_signal = results[0]
 
-    # Remaining apertures are noise samples
-    noise_vals = torch.tensor(
-        [res for res in results[1:]], dtype=torch.float32)
+    # Keep-out zone radius: (N + 0.5) * fwhm — mirrors the target-planet buffer
+    # and is independent of the other planet's ring geometry.
+    r_exclude = (exclude_nearest + 0.5) * fwhm
 
+    noise_results = []
+    for (offset_x, offset_y), res in zip(locations[1:], results[1:]):
+        abs_x = cx + offset_x
+        abs_y = cy + offset_y
+        if known_planets and any(
+            np.sqrt((abs_x - kx) ** 2 + (abs_y - ky) ** 2) < r_exclude
+            for (kx, ky) in known_planets
+        ):
+            continue  # inside keep-out zone of another planet — skip
+        noise_results.append(res)
+
+    if len(noise_results) < 2:
+        logger.warning(
+            f"Only {len(noise_results)} noise aperture(s) remain after excluding "
+            "known planets. SNR estimate will be unreliable."
+        )
+
+    noise_vals = torch.tensor(noise_results, dtype=torch.float32)
     return calc_snr_mawet(planet_signal, noise_vals)
 
 
@@ -237,7 +265,9 @@ def compute_snr(klip_image: Union[torch.Tensor, np.ndarray],
                 exclude_nearest: int = 0,
                 operation: Callable[[torch.Tensor],
                                     torch.Tensor] = torch.nanmedian,
-                verbose: bool = True) -> Union[torch.Tensor, List[torch.Tensor]]:
+                verbose: bool = True,
+                known_planets: Optional[List[Tuple[float, float]]] = None,
+                ) -> Union[torch.Tensor, List[torch.Tensor]]:
     """
     Compute the SNR of a planet in a KLIP-processed image using PyTorch operations.
     Works with both 2D and 3D images. For 3D images, returns a list of SNR values for each frame.
@@ -250,7 +280,12 @@ def compute_snr(klip_image: Union[torch.Tensor, np.ndarray],
         exclude_planet (bool, optional): If True, do not include the planet aperture in noise estimation.
         exclude_nearest (int, optional): Number of adjacent apertures to exclude.
         operation (Callable, optional): Operation to apply within each aperture (default: torch.nanmedian).
-        verbose(bool, optional): If True, print the SNR result.
+        verbose (bool, optional): If True, print the SNR result.
+        known_planets (List[Tuple[float, float]], optional): Pixel ``(x, y)`` centres
+            of other known planets in the field.  Any noise aperture whose centre lies
+            within a keep-out radius of ``(exclude_nearest + 0.5) * fwhm`` from one of
+            these positions is excluded from the noise sample.  Pass only the planet
+            centres — the keep-out radius scales automatically with ``exclude_nearest``.
 
     Returns:
         Union[torch.Tensor, List[torch.Tensor]]:
@@ -265,7 +300,8 @@ def compute_snr(klip_image: Union[torch.Tensor, np.ndarray],
     if klip_image.ndim == 2:
         snr = _snr_single_frame(
             klip_image, planet_x, planet_y, fwhm,
-            exclude_planet, exclude_nearest, operation
+            exclude_planet, exclude_nearest, operation,
+            known_planets=known_planets,
         )
         if verbose:
             logger.info(f"SNR: {snr.item():.2f}")
@@ -276,7 +312,8 @@ def compute_snr(klip_image: Union[torch.Tensor, np.ndarray],
     for idx in range(klip_image.shape[0]):
         snr = _snr_single_frame(
             klip_image[idx], planet_x, planet_y, fwhm,
-            exclude_planet, exclude_nearest, operation
+            exclude_planet, exclude_nearest, operation,
+            known_planets=known_planets,
         )
         if verbose:
             logger.info(f"Frame {idx}: SNR = {snr.item():.2f}")
@@ -346,14 +383,17 @@ def draw_apertures(
     image_shape: Tuple[int, int],
     color: str = "cyan",
     exclude_nearest: int = 0,
+    known_planets: Optional[List[Tuple[float, float]]] = None,
 ) -> None:
     """Overlay planet and noise aperture circles on *ax*.
 
     Planet aperture: solid circle.
-    Noise apertures: dashed circles, same colour, lower alpha.
+    Noise apertures used in SNR: dashed circles, same colour, lower alpha.
+    Noise apertures inside the keep-out zone of another planet: dotted orange.
 
-    Pass the same ``exclude_nearest`` value used in :func:`compute_snr` so the
-    plotted circles exactly match the apertures used in the SNR calculation.
+    Uses the exact same distance threshold as :func:`compute_snr` —
+    ``(exclude_nearest + 0.5) * fwhm`` — so every aperture drawn in orange is
+    also mathematically skipped in the SNR calculation, and vice-versa.
 
     Args:
         ax: Matplotlib ``Axes`` object (image already plotted).
@@ -364,10 +404,15 @@ def draw_apertures(
         color: Circle edge colour (default ``"cyan"``).
         exclude_nearest: Number of apertures to skip on either side of the
             planet — must match the value passed to :func:`compute_snr`.
+        known_planets: Pixel ``(x, y)`` centres of other known planets — must
+            match the value passed to :func:`compute_snr`.  Noise apertures
+            within ``(exclude_nearest + 0.5) * fwhm`` of any of these positions
+            are drawn in orange dotted style.
     """
     import matplotlib.patches as mpatches
 
     r = fwhm / 2.0
+    r_exclude = (exclude_nearest + 0.5) * fwhm
 
     # Planet aperture — solid
     ax.add_patch(mpatches.Circle(
@@ -375,15 +420,26 @@ def draw_apertures(
         edgecolor=color, facecolor="none", linewidth=1.5, linestyle="-",
     ))
 
-    # Noise apertures — dashed, honouring the same exclusion as compute_snr
+    # Noise apertures — same threshold as _snr_single_frame
     for (nx, ny) in noise_aperture_centers(
         image_shape, planet_x, planet_y, fwhm, exclude_nearest=exclude_nearest
     ):
-        ax.add_patch(mpatches.Circle(
-            (nx, ny), radius=r,
-            edgecolor=color, facecolor="none", linewidth=1.0,
-            linestyle="--", alpha=0.6,
-        ))
+        is_excluded = known_planets and any(
+            np.sqrt((nx - kx) ** 2 + (ny - ky) ** 2) < r_exclude
+            for (kx, ky) in known_planets
+        )
+        if is_excluded:
+            ax.add_patch(mpatches.Circle(
+                (nx, ny), radius=r,
+                edgecolor="orange", facecolor="none", linewidth=1.0,
+                linestyle=":", alpha=0.8,
+            ))
+        else:
+            ax.add_patch(mpatches.Circle(
+                (nx, ny), radius=r,
+                edgecolor=color, facecolor="none", linewidth=1.0,
+                linestyle="--", alpha=0.6,
+            ))
 
 
 __all__ = ["compute_snr", "noise_aperture_centers", "draw_apertures"]

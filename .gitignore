@@ -35,12 +35,13 @@ CLAUDE.md
 logs/*
 data/*
 outputs/*
+results/*
 
 # Ignore some files in notebooks/
 notebooks/*.jpg
 notebooks/*.npy
 notebooks/outputs/*
-notebooks/betaPic.py
+notebooks/*.py
 
 # But don’t ignore the placeholders
 !logs/.gitkeep
