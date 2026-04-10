@@ -137,6 +137,7 @@ def compute_residuals(datacube: DataTensor,
                       method: str = "svd",
                       store_intermediates: bool = False,
                       return_diagnostics: bool = False,
+                      ref_datacube: Optional[DataTensor] = None,
                       ) -> Union[torch.Tensor,
                                  ResidualsWithIntermediates,
                                  Tuple[torch.Tensor, "KLIPDiagnostics"]]:
@@ -147,8 +148,13 @@ def compute_residuals(datacube: DataTensor,
     to perform PSF subtraction. It computes the KL basis, projects the input frames,
     and returns the residual frames after subtracting the reconstructions.
 
+    When ``ref_datacube`` is provided the function operates in **RDI mode**: the KL
+    basis is built from the reference library and the projection/subtraction is
+    applied to the science (target) ``datacube``.  K is then bounded by the number
+    of reference frames rather than target frames.
+
     Args:
-        datacube: DataTensor containing the input frames.
+        datacube: DataTensor containing the science (target) frames.
         K_klip: Integer or list of integers specifying KL mode counts.
         method: Basis computation method, one of 'svd', 'pca', or 'eigh'.
         store_intermediates: If True, return flat intermediate arrays in a
@@ -157,6 +163,9 @@ def compute_residuals(datacube: DataTensor,
         return_diagnostics: If True, return a ``(residuals, KLIPDiagnostics)``
             tuple containing image-shaped diagnostic arrays for every K value.
             Takes precedence over ``store_intermediates``.
+        ref_datacube: Optional reference-star DataTensor for RDI.  When
+            supplied the KL basis is derived from these frames; ``datacube``
+            (science) is only used for projection and residual computation.
 
     Returns:
         * Default (both flags False): Tensor of shape ``(n_k_values, nk, ny, nx)``.
@@ -174,19 +183,31 @@ def compute_residuals(datacube: DataTensor,
     logger.info("Starting compute_residuals")
     nk, ny, nx = datacube.nk, datacube.ny, datacube.nx
 
+    # RDI: K is bounded by the reference library size, not the target cube.
+    nk_basis = ref_datacube.nk if ref_datacube is not None else nk
+
     # Normalize and validate K_klip
-    K_list = _normalize_and_validate_K(K_klip, nk, logger)
+    K_list = _normalize_and_validate_K(K_klip, nk_basis, logger)
     K_max = K_list[-1]
 
-    # Capture temporal mean BEFORE in-place mean subtraction
+    # Capture temporal mean of TARGET before in-place mean subtraction
     if return_diagnostics:
         mean_frame = torch.nanmean(datacube.tensor, dim=0)  # (ny, nx)
 
-    # Prepare data: mean‐subtract and replace NaNs
+    # Prepare science data: mean‐subtract and replace NaNs
     logger.debug("Mean-subtracting datacube and replacing NaNs")
     processed = datacube.mean_subtract_()
     data = torch.nan_to_num(processed.tensor, nan=0.0)
-    ref_flat = data.view(nk, -1)  # shape: (nk, ny*nx)
+    target_flat = data.view(nk, -1)  # shape: (nk, ny*nx)
+
+    # Build the matrix used to compute the KL basis
+    if ref_datacube is not None:
+        logger.debug("RDI mode: building KL basis from reference library")
+        ref_processed = ref_datacube.mean_subtract_()
+        ref_data = torch.nan_to_num(ref_processed.tensor, nan=0.0)
+        basis_input = ref_data.view(ref_datacube.nk, -1)  # (nk_ref, ny*nx)
+    else:
+        basis_input = target_flat  # ADI: self-reference
 
     # Compute KL basis
     logger.info(f"Computing KL basis with method={method!r}, K_max={K_max}")
@@ -197,8 +218,11 @@ def compute_residuals(datacube: DataTensor,
         logger.error(error_msg)
         raise ValueError(error_msg)
 
-    Z_KL = basis_fn(ref_flat, K_max)  # shape: (ny*nx, K_max)
+    Z_KL = basis_fn(basis_input, K_max)  # shape: (ny*nx, K_max)
     logger.debug(f"Basis shape: {tuple(Z_KL.shape)}")
+
+    # Alias so the projection loop below works identically for ADI and RDI
+    ref_flat = target_flat
 
     # Always compute a 4D tensor for residuals (n_k_values, nk, ny, nx)
     residuals = torch.zeros(len(K_list), nk, ny, nx, device=data.device)
@@ -400,17 +424,21 @@ class TorchKLIP:
                  #   OWA: Optional[float] = None,
                  device: str = "cpu",
                  collect_metrics: bool = True,
-                 store_intermediates: bool = False) -> None:
+                 store_intermediates: bool = False,
+                 ref_data: Optional[DataTensor] = None) -> None:
         """Initializes the TorchKLIP processor.
 
         Args:
-            datacube: DataTensor containing the input frames.
+            datacube: DataTensor containing the science (target) frames.
             angles: List or tensor of derotation angles in degrees.
             IWA: Inner Working Angle for annular mask in pixels (optional).
             OWA: Outer Working Angle for annular mask in pixels (optional).
             device: Device to run computation on ('cpu' or 'cuda').
             collect_metrics: If True, record timing metrics.
             store_intermediates: If True, keep intermediate arrays.
+            ref_data: Optional reference-star DataTensor for RDI mode.  When
+                supplied, ``klip_and_derotate`` with ``mode='rdi'`` builds the
+                KL basis from this library rather than the science frames.
 
         Raises:
             ValueError: If number of angles doesn't match number of frames.
@@ -418,6 +446,9 @@ class TorchKLIP:
 
         self.device = torch.device(device)
         self.datacube = datacube.to(device)
+        self.ref_datacube: Optional[DataTensor] = (
+            ref_data.to(device) if ref_data is not None else None
+        )
         if isinstance(angles, torch.Tensor):
             self.angles = angles.clone().detach().to(
                 dtype=torch.float32, device=self.device)
@@ -480,7 +511,9 @@ class TorchKLIP:
             method: Method for computing basis ("svd", "pca", or "eigh").
             statistic: Statistic for combining frames ("mean" or "median").
             isbatch: Whether to use batch rotation.
-            mode: Processing mode ("adi" only supported currently).
+            mode: Processing mode — ``"adi"`` (self-reference) or ``"rdi"``
+                (external reference library supplied via ``ref_data`` at
+                construction time).
             return_diagnostics: If True, return a ``(result, KLIPDiagnostics)``
                 tuple instead of just ``result``.  The :class:`KLIPDiagnostics`
                 object contains the following image-shaped arrays:
@@ -502,9 +535,13 @@ class TorchKLIP:
               *result* has the same shape as above.
         """
         # Validate processing mode
-        if mode.lower() != "adi":
+        mode = mode.lower()
+        if mode not in ("adi", "rdi"):
             raise NotImplementedError(
-                f"Mode '{mode}' not supported; only 'adi' is implemented.")
+                f"Mode '{mode}' not supported; choose 'adi' or 'rdi'.")
+        if mode == "rdi" and self.ref_datacube is None:
+            raise ValueError(
+                "mode='rdi' requires ref_data to be provided at construction time.")
 
         # Track if input is a single K value for final output shape
         is_single_k = isinstance(K_klip, int)
@@ -513,17 +550,22 @@ class TorchKLIP:
         logger.info(
             f"Running KLIP with K={k_list}, method={method}, statistic={statistic}")
 
+        # In RDI mode, pass the reference library to compute_residuals.
+        ref_dc = self.ref_datacube if mode == "rdi" else None
+
         # 1. PSF subtraction
         self.perfmon.start_timer("total")
         self.perfmon.start_timer("psfsub")
         if return_diagnostics:
             residuals, diagnostics = compute_residuals(
-                self.datacube, k_list, method, return_diagnostics=True
+                self.datacube, k_list, method,
+                return_diagnostics=True, ref_datacube=ref_dc,
             )
             self.diagnostics = diagnostics
         elif self.store_intermediates:
             out = compute_residuals(
-                self.datacube, k_list, method, store_intermediates=True
+                self.datacube, k_list, method,
+                store_intermediates=True, ref_datacube=ref_dc,
             )
             if isinstance(out, ResidualsWithIntermediates):
                 residuals = out.residuals
@@ -535,7 +577,9 @@ class TorchKLIP:
                 residuals, self.Z_KL, self.proj, self.ihat, self.residual_flat = out
             self.residuals = residuals
         else:
-            residuals = compute_residuals(self.datacube, k_list, method)
+            residuals = compute_residuals(
+                self.datacube, k_list, method, ref_datacube=ref_dc,
+            )
         self.perfmon.stop_timer("psfsub")
 
         # 2. Derotation
