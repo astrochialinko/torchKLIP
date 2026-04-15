@@ -10,7 +10,9 @@ from torchklip.algos.klip.pca import compute_basis_pca
 from torchklip.algos.klip.eigh import compute_basis_eigh
 from torchklip.algos.klip.klip_base import (
     _normalize_and_validate_K,
+    _group_frames_by_pa,
     compute_residuals,
+    compute_residuals_hybrid,
     batch_rotate,
     derotate_cube,
     combine_cube,
@@ -443,6 +445,216 @@ def test_klip_diagnostics_public_api():
     """KLIPDiagnostics is importable from the top-level package."""
     import torchklip
     assert hasattr(torchklip, "KLIPDiagnostics")
+
+
+# ---------------------------------------------------------------------------
+# Hybrid (ADI + RDI) mode tests
+# ---------------------------------------------------------------------------
+
+def test_group_frames_by_pa():
+    """_group_frames_by_pa groups consecutive frames below threshold."""
+    # Slow drift: all frames should end up in one group at threshold=1.0
+    angles = torch.tensor([0.0, 0.3, 0.6, 0.9, 1.5, 2.0])
+    groups = _group_frames_by_pa(angles, pa_reuse_threshold=1.0)
+    # Frame 4 (PA=1.5) starts a new group (|1.5-0.0| >= 1.0)
+    assert len(groups) >= 2
+    # All frames are covered without overlap
+    all_indices = sorted(idx for grp in groups for idx in grp)
+    assert all_indices == list(range(len(angles)))
+
+    # Large threshold: everything in one group
+    groups_single = _group_frames_by_pa(angles, pa_reuse_threshold=10.0)
+    assert len(groups_single) == 1
+    assert groups_single[0] == list(range(len(angles)))
+
+    # Tiny threshold: each frame in its own group
+    angles_distinct = torch.tensor([0.0, 1.0, 2.0, 3.0])
+    groups_all_split = _group_frames_by_pa(angles_distinct, pa_reuse_threshold=0.5)
+    assert len(groups_all_split) == 4
+
+    # Edge case: single frame
+    groups_one = _group_frames_by_pa(torch.tensor([45.0]), pa_reuse_threshold=1.0)
+    assert groups_one == [[0]]
+
+    # Edge case: empty
+    assert _group_frames_by_pa(torch.tensor([]), pa_reuse_threshold=1.0) == []
+
+
+def test_hybrid_mode_basic_shapes(synthetic_datacube):
+    """compute_residuals_hybrid returns correct output shapes."""
+    datacube, angles = synthetic_datacube
+    nk, ny, nx = datacube.nk, datacube.ny, datacube.nx
+
+    # Single K → shape (1, nk, ny, nx)
+    residuals = compute_residuals_hybrid(datacube, 3, angles)
+    assert residuals.shape == (1, nk, ny, nx)
+
+    # Multiple K → shape (n_K, nk, ny, nx)
+    K_list = [1, 2, 3]
+    residuals = compute_residuals_hybrid(datacube, K_list, angles)
+    assert residuals.shape == (len(K_list), nk, ny, nx)
+
+    # Output should be finite (no spurious NaN from numerical errors)
+    assert torch.isfinite(residuals).all()
+
+
+def test_hybrid_mode_all_methods(synthetic_datacube):
+    """All basis strategies work in hybrid mode."""
+    datacube, angles = synthetic_datacube
+    nk, ny, nx = datacube.nk, datacube.ny, datacube.nx
+
+    for method in ("svd", "pca", "eigh"):
+        res = compute_residuals_hybrid(datacube, 2, angles, method=method)
+        assert res.shape == (1, nk, ny, nx), f"Wrong shape for method={method}"
+
+    with pytest.raises(ValueError):
+        compute_residuals_hybrid(datacube, 2, angles, method="bad_method")
+
+
+def test_hybrid_mode_angular_exclusion(synthetic_datacube):
+    """Increasing annular_exclusion shrinks the target sub-library."""
+    datacube, angles = synthetic_datacube
+    nk, ny, nx = datacube.nk, datacube.ny, datacube.nx
+
+    # With exclusion = 0, all frames with non-identical PA are included
+    res_no_excl = compute_residuals_hybrid(
+        datacube, 3, angles, annular_exclusion=0.0
+    )
+    # With very wide exclusion (> max PA spread), no target frames qualify;
+    # the function falls back to the full target library (logged warning)
+    res_wide_excl = compute_residuals_hybrid(
+        datacube, 3, angles, annular_exclusion=360.0
+    )
+    # Both should have the correct shape
+    assert res_no_excl.shape == (1, nk, ny, nx)
+    assert res_wide_excl.shape == (1, nk, ny, nx)
+
+
+def test_hybrid_mode_with_reference(synthetic_datacube):
+    """Hybrid mode with a reference library uses both ref and target frames."""
+    datacube, angles = synthetic_datacube
+    nk, ny, nx = datacube.nk, datacube.ny, datacube.nx
+
+    # Build a small synthetic reference library
+    ref_tensor = torch.randn(4, ny, nx)
+    ref_datacube = DataTensor(ref_tensor)
+
+    # K bounded by n_ref + nk = 4 + 5 = 9; requesting K=4 is fine
+    residuals = compute_residuals_hybrid(
+        datacube, 4, angles, ref_datacube=ref_datacube
+    )
+    assert residuals.shape == (1, nk, ny, nx)
+
+
+def test_hybrid_mode_diagnostics(synthetic_datacube):
+    """return_diagnostics=True populates KLIPDiagnostics correctly."""
+    datacube, angles = synthetic_datacube
+    nk, ny, nx = datacube.nk, datacube.ny, datacube.nx
+    K_list = [1, 3]
+
+    result = compute_residuals_hybrid(
+        datacube, K_list, angles, return_diagnostics=True
+    )
+    assert isinstance(result, tuple) and len(result) == 2
+
+    residuals, diag = result
+    assert isinstance(diag, KLIPDiagnostics)
+
+    K_max = max(K_list)
+    n_K = len(K_list)
+
+    assert residuals.shape == (n_K, nk, ny, nx)
+    assert diag.kl_basis.shape == (K_max, ny, nx)
+    assert diag.mean_frame.shape == (ny, nx)
+    assert diag.psf_estimates.shape == (n_K, nk, ny, nx)
+    assert diag.residual_frames.shape == (n_K, nk, ny, nx)
+    assert diag.coefficients.shape == (nk, K_max)
+    assert diag.K_list == sorted(K_list)
+
+    # residual_frames must equal the returned residuals tensor
+    assert torch.allclose(diag.residual_frames, residuals, equal_nan=True)
+
+    # residuals + psf_estimates ≈ mean-subtracted input
+    combined = diag.residual_frames[-1] + diag.psf_estimates[-1]
+    valid = ~torch.isnan(combined)
+    assert valid.any()
+
+
+def test_torchklip_hybrid_mode(synthetic_datacube):
+    """TorchKLIP.klip_and_derotate with mode='hybrid' runs end-to-end."""
+    datacube, angles = synthetic_datacube
+    nk, ny, nx = datacube.nk, datacube.ny, datacube.nx
+
+    klip = TorchKLIP(datacube, angles, collect_metrics=True)
+
+    # Single K — result squeezed to 2D
+    result = klip.klip_and_derotate(3, mode="hybrid")
+    assert result.shape == (ny, nx)
+    assert isinstance(result, torch.Tensor)
+
+    # Multiple K — result is 3D
+    result_multi = klip.klip_and_derotate([1, 2, 3], mode="hybrid")
+    assert result_multi.shape == (3, ny, nx)
+
+    # With diagnostics
+    result_diag, diag = klip.klip_and_derotate(
+        [1, 3], mode="hybrid", return_diagnostics=True
+    )
+    assert result_diag.shape == (2, ny, nx)
+    assert isinstance(diag, KLIPDiagnostics)
+    assert klip.diagnostics is diag
+
+    # Metrics should still be collected
+    assert "psfsub_time" in klip.metrics
+    assert "total_time" in klip.metrics
+
+
+def test_torchklip_hybrid_with_annular_exclusion(synthetic_datacube):
+    """annular_exclusion parameter is forwarded correctly in hybrid mode."""
+    datacube, angles = synthetic_datacube
+    ny, nx = datacube.ny, datacube.nx
+
+    klip = TorchKLIP(datacube, angles)
+    result = klip.klip_and_derotate(
+        2, mode="hybrid", annular_exclusion=10.0, pa_reuse_threshold=1.0
+    )
+    assert result.shape == (ny, nx)
+
+
+def test_torchklip_hybrid_with_reference(synthetic_datacube):
+    """Hybrid mode with external reference library via TorchKLIP."""
+    datacube, angles = synthetic_datacube
+    nk, ny, nx = datacube.nk, datacube.ny, datacube.nx
+
+    ref_tensor = torch.randn(4, ny, nx)
+    ref_dc = DataTensor(ref_tensor)
+
+    klip = TorchKLIP(datacube, angles, ref_data=ref_dc)
+    result = klip.klip_and_derotate(4, mode="hybrid")
+    assert result.shape == (ny, nx)
+
+
+def test_torchklip_unsupported_mode_raises(synthetic_datacube):
+    """Unsupported mode raises NotImplementedError for all known bad inputs."""
+    datacube, angles = synthetic_datacube
+    klip = TorchKLIP(datacube, angles)
+    with pytest.raises(NotImplementedError):
+        klip.klip_and_derotate(2, mode="bad_mode")
+
+
+def test_torchklip_hybrid_nan_restoration(synthetic_datacube):
+    """NaN pixels in the input are restored in hybrid mode output."""
+    datacube, angles = synthetic_datacube
+    nk, ny, nx = datacube.nk, datacube.ny, datacube.nx
+
+    # Inject NaN pixels into a copy of the datacube
+    cube_with_nan = datacube.tensor.clone()
+    cube_with_nan[:, 0, 0] = float("nan")
+    nan_dc = DataTensor(cube_with_nan)
+
+    residuals = compute_residuals_hybrid(nan_dc, 2, angles)
+    # The NaN position must be propagated
+    assert torch.isnan(residuals[:, :, 0, 0]).all()
 
 
 if __name__ == "__main__":
