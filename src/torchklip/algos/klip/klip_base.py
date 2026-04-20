@@ -287,6 +287,30 @@ def compute_residuals(datacube: DataTensor,
 # Hybrid (ADI + RDI) helpers
 # ---------------------------------------------------------------------------
 
+def _normalize_library(frames: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
+    """Normalize each frame (row) of a library matrix to unit L2-norm.
+
+    This ensures that every frame contributes equal power to the SVD
+    covariance matrix, preventing a large reference library from
+    numerically dominating a small target subset.
+
+    Frames that are entirely zero or masked (all NaN→0) have a near-zero
+    norm; their norm is clamped to *eps* so no division-by-zero occurs,
+    and they effectively stay zero-valued after normalization.
+
+    Args:
+        frames: ``(n_frames, n_pixels)`` float tensor (NaNs already replaced
+            with 0 by the caller).
+        eps: Minimum norm value; prevents division by zero for blank frames.
+
+    Returns:
+        Normalized ``(n_frames, n_pixels)`` tensor where each row has
+        L2-norm ≤ 1 (exactly 1 for non-blank frames).
+    """
+    norms = torch.norm(frames, dim=1, keepdim=True)  # (n_frames, 1)
+    norms = torch.clamp(norms, min=eps)
+    return frames / norms
+
 def _group_frames_by_pa(
     angles: torch.Tensor,
     pa_reuse_threshold: float = 0.5,
@@ -338,6 +362,7 @@ def compute_residuals_hybrid(
     pa_reuse_threshold: float = 0.5,
     return_diagnostics: bool = False,
     ref_datacube: Optional[DataTensor] = None,
+    hybrid_weight: float = 1.0,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, KLIPDiagnostics]]:
     """Compute PSF-subtracted residuals in ADI+RDI hybrid (``'hybrid'``) mode.
 
@@ -381,6 +406,18 @@ def compute_residuals_hybrid(
         ref_datacube: Optional external reference-star DataTensor.  Its frames
             are always included in the library regardless of their PA.  When
             ``None`` the mode degrades to ADI-only with angular exclusion.
+        hybrid_weight: Multiplicative scale applied to the **normalized**
+            target frames before concatenating them with the reference
+            library for SVD.  Default ``1.0`` (equal amplitude).  Setting
+            this above ``1.0`` upweights the self-reference (ADI) component
+            so that a large reference library does not dominate the KL
+            basis.  For example, ``hybrid_weight=3.0`` gives the target
+            frames roughly 3× the per-frame amplitude of reference frames
+            in the SVD covariance matrix.
+
+            Both the reference and target libraries are per-frame L2
+            normalized before this weight is applied, so the effect is
+            independent of the raw flux scale of each dataset.
 
     Returns:
         * Default: Tensor ``(n_K, nk, ny, nx)`` of PSF-subtracted residuals.
@@ -412,11 +449,24 @@ def compute_residuals_hybrid(
 
     # Prepare reference frames when provided
     ref_flat: Optional[torch.Tensor] = None
+    ref_flat_norm: Optional[torch.Tensor] = None
     if ref_datacube is not None:
         logger.debug("Hybrid: mean-subtracting reference library")
         ref_processed = ref_datacube.mean_subtract_()
         ref_data = torch.nan_to_num(ref_processed.tensor, nan=0.0)
         ref_flat = ref_data.view(n_ref, -1)  # (n_ref, ny*nx)
+        ref_flat_norm = _normalize_library(ref_flat)
+
+    # Pre-compute normalized target frames (for basis construction only).
+    # The projection step always uses the original target_flat.
+    target_flat_norm = _normalize_library(target_flat)
+
+    if ref_flat is not None:
+        logger.debug(
+            f"Hybrid: n_ref={n_ref}, n_target={nk}, "
+            f"hybrid_weight={hybrid_weight:.3g}  "
+            "(per-frame L2 normalization applied to both libraries before SVD)"
+        )
 
     # Select basis strategy
     try:
@@ -457,26 +507,39 @@ def compute_residuals_hybrid(
         valid_mask: torch.Tensor = pa_diff > annular_exclusion  # (nk,) bool
         n_valid: int = int(valid_mask.sum().item())
 
-        # Assemble the combined library L
-        lib_parts: List[torch.Tensor] = []
-        if ref_flat is not None:
-            lib_parts.append(ref_flat)                    # always include ref
+        # Assemble the combined library for SVD using normalized frames.
+        # Normalization ensures each frame contributes equal power to the KL
+        # basis regardless of raw flux differences between the two datasets.
+        # hybrid_weight upscales the target subset so it is not washed out
+        # when n_ref >> n_valid.
+        lib_parts_norm: List[torch.Tensor] = []
+        if ref_flat_norm is not None:
+            lib_parts_norm.append(ref_flat_norm)           # unit-norm ref rows
         if n_valid > 0:
-            lib_parts.append(target_flat[valid_mask])     # angularly valid targets
+            # Scale target frames by hybrid_weight for basis construction
+            lib_parts_norm.append(
+                target_flat_norm[valid_mask] * hybrid_weight
+            )
 
-        if not lib_parts:
-            # Degenerate edge case: annular_exclusion is so wide that the entire
-            # target falls inside the exclusion zone and there is no reference
-            # library.  Fall back to the full target to avoid a crash.
+        if not lib_parts_norm:
+            # Degenerate edge case: annular_exclusion so wide that the entire
+            # target falls inside the exclusion zone with no reference library.
+            # Fall back to normalized full target to avoid a crash.
             logger.warning(
                 f"Hybrid group {grp_idx}: empty library for "
                 f"PA_rep={rep_pa:.2f} deg, "
                 f"annular_exclusion={annular_exclusion} deg. "
-                "Falling back to full target library."
+                "Falling back to normalized full target library."
             )
-            lib = target_flat
+            lib = target_flat_norm * hybrid_weight
         else:
-            lib = torch.cat(lib_parts, dim=0)              # (n_lib, ny*nx)
+            lib = torch.cat(lib_parts_norm, dim=0)         # (n_lib, ny*nx)
+
+        logger.debug(
+            f"Hybrid group {grp_idx}: basis lib n_rows={lib.shape[0]} "
+            f"(ref={n_ref if ref_flat_norm is not None else 0}, "
+            f"target_valid={n_valid}, hybrid_weight={hybrid_weight:.3g})"
+        )
 
         # SVD rank cannot exceed the number of library frames
         k_max_eff = min(K_max, lib.shape[0])
@@ -774,6 +837,7 @@ class TorchKLIP:
                           return_diagnostics: bool = False,
                           annular_exclusion: float = 0.0,
                           pa_reuse_threshold: float = 0.5,
+                          hybrid_weight: float = 1.0,
                           ) -> Union[torch.Tensor,
                                      Tuple[torch.Tensor, KLIPDiagnostics]]:
         """
@@ -825,6 +889,13 @@ class TorchKLIP:
             pa_reuse_threshold: PA change in degrees that triggers a new SVD
                 computation in ``hybrid`` mode.  Frames within the same PA
                 batch share a single KL basis.  Default ``0.5`` deg.
+            hybrid_weight: Relative amplitude of target frames versus
+                reference frames when building the KL basis in ``hybrid``
+                mode.  Both libraries are per-frame L2-normalized before
+                this scale is applied, so ``1.0`` (default) gives equal
+                per-frame weight.  Increase above ``1.0`` to prevent a
+                large reference library from dominating the SVD.
+                Has no effect in ``adi`` or ``rdi`` mode.
 
         Returns:
             * Default: 2D tensor ``(ny, nx)`` for single K, or 3D tensor
@@ -873,6 +944,7 @@ class TorchKLIP:
                     pa_reuse_threshold=pa_reuse_threshold,
                     return_diagnostics=True,
                     ref_datacube=self.ref_datacube,
+                    hybrid_weight=hybrid_weight,
                 )
                 self.diagnostics = diagnostics
             else:
@@ -881,6 +953,7 @@ class TorchKLIP:
                     annular_exclusion=annular_exclusion,
                     pa_reuse_threshold=pa_reuse_threshold,
                     ref_datacube=self.ref_datacube,
+                    hybrid_weight=hybrid_weight,
                 )
         else:
             # ADI or RDI path (unchanged)
