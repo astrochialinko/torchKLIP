@@ -1,4 +1,6 @@
 # File: src/torchklip/algos/klip/klip_base.py
+# Modified: RDI/hybrid mask consistency, optional reference normalisation,
+#           reference-frame selection, size validation.
 import time
 from dataclasses import dataclass
 from typing import Union, List, Optional, Tuple
@@ -141,6 +143,7 @@ def compute_residuals(datacube: DataTensor,
                       store_intermediates: bool = False,
                       return_diagnostics: bool = False,
                       ref_datacube: Optional[DataTensor] = None,
+                      normalize_ref: bool = False,
                       ) -> Union[torch.Tensor,
                                  ResidualsWithIntermediates,
                                  Tuple[torch.Tensor, "KLIPDiagnostics"]]:
@@ -169,6 +172,19 @@ def compute_residuals(datacube: DataTensor,
         ref_datacube: Optional reference-star DataTensor for RDI.  When
             supplied the KL basis is derived from these frames; ``datacube``
             (science) is only used for projection and residual computation.
+            Its image size must match ``datacube`` and its masked (NaN) pixels
+            should be a superset of the science mask (``TorchKLIP`` ensures
+            this automatically).
+        normalize_ref: RDI only.  If True, every reference frame is scaled to
+            unit L2-norm (after mean subtraction) before the KL basis is
+            built, so bright reference frames do not dominate the covariance.
+            Projection of the science frames is unaffected.  Default False
+            (identical to the previous behaviour).
+
+    Note:
+        ``datacube`` and ``ref_datacube`` are mean-subtracted **in place**.
+        ``TorchKLIP`` passes private copies, so this only matters when
+        calling :func:`compute_residuals` directly.
 
     Returns:
         * Default (both flags False): Tensor of shape ``(n_k_values, nk, ny, nx)``.
@@ -185,6 +201,13 @@ def compute_residuals(datacube: DataTensor,
     """
     logger.info("Starting compute_residuals")
     nk, ny, nx = datacube.nk, datacube.ny, datacube.nx
+
+    # RDI: the reference must live on the same pixel grid as the science cube.
+    if ref_datacube is not None and \
+            tuple(ref_datacube.shape[1:]) != (ny, nx):
+        raise ValueError(
+            f"ref_datacube image size {tuple(ref_datacube.shape[1:])} != "
+            f"science image size {(ny, nx)}")
 
     # RDI: K is bounded by the reference library size, not the target cube.
     nk_basis = ref_datacube.nk if ref_datacube is not None else nk
@@ -209,6 +232,9 @@ def compute_residuals(datacube: DataTensor,
         ref_processed = ref_datacube.mean_subtract_()
         ref_data = torch.nan_to_num(ref_processed.tensor, nan=0.0)
         basis_input = ref_data.view(ref_datacube.nk, -1)  # (nk_ref, ny*nx)
+        if normalize_ref:
+            logger.debug("RDI: L2-normalising reference frames")
+            basis_input = _normalize_library(basis_input)
     else:
         basis_input = target_flat  # ADI: self-reference
 
@@ -735,6 +761,78 @@ def combine_cube(derotated: torch.Tensor,
         raise ValueError("statistic must be 'mean' or 'median'")
 
 
+# ---------------------------------------------------------------------------
+# RDI helpers: mask sharing and reference-frame selection
+# ---------------------------------------------------------------------------
+
+def _share_nan_mask(sci: DataTensor, ref: DataTensor) -> None:
+    """Mask in ``ref`` every pixel that is NaN in any science frame.
+
+    Operates **in place on** ``ref`` only; ``sci`` is never modified, so ADI
+    results are unaffected.  After this call the reference library is zero
+    (after ``nan_to_num``) exactly where the science frames are zero, which
+    keeps the KL basis and the science projection on the same pixel set.
+
+    Args:
+        sci: Science DataTensor (already circularly masked, if applicable).
+        ref: Reference DataTensor with the same ``(ny, nx)``.
+
+    Raises:
+        ValueError: If the image sizes differ.
+    """
+    if tuple(sci.shape[1:]) != tuple(ref.shape[1:]):
+        raise ValueError(
+            f"ref image size {tuple(ref.shape[1:])} != "
+            f"science image size {tuple(sci.shape[1:])}")
+    sci_nan = torch.isnan(sci.tensor).any(dim=0)          # (ny, nx)
+    ref.tensor[:, sci_nan] = float("nan")
+
+
+def select_reference_frames(sci: DataTensor,
+                            ref: DataTensor,
+                            n_keep: int) -> DataTensor:
+    """Keep the ``n_keep`` reference frames most correlated with the science.
+
+    Correlation (Pearson) is computed between each reference frame and the
+    median science frame over the pixels that are valid in the science cube.
+
+    Args:
+        sci: Science DataTensor.
+        ref: Reference DataTensor (same ``(ny, nx)``).
+        n_keep: Number of reference frames to keep (clipped to ``ref.nk``).
+
+    Returns:
+        A new DataTensor holding the selected reference frames, ordered from
+        most to least correlated.
+
+    Raises:
+        ValueError: If ``n_keep < 1`` or the image sizes differ.
+    """
+    if n_keep < 1:
+        raise ValueError("n_keep must be >= 1")
+    if tuple(sci.shape[1:]) != tuple(ref.shape[1:]):
+        raise ValueError(
+            f"ref image size {tuple(ref.shape[1:])} != "
+            f"science image size {tuple(sci.shape[1:])}")
+
+    n_keep = min(n_keep, ref.nk)
+    sci_med = torch.nanmedian(sci.tensor, dim=0).values.flatten()   # (P,)
+    valid = ~torch.isnan(sci.tensor).any(dim=0).flatten() & ~torch.isnan(sci_med)
+
+    s = sci_med[valid]
+    r = torch.nan_to_num(ref.tensor.flatten(1)[:, valid], nan=0.0)  # (N, P_valid)
+    s = s - s.mean()
+    r = r - r.mean(dim=1, keepdim=True)
+    corr = (r @ s) / (r.norm(dim=1) * s.norm() + 1e-12)
+
+    idx = torch.argsort(corr, descending=True)[:n_keep]
+    logger.info(
+        f"Selected {n_keep}/{ref.nk} reference frames "
+        f"(corr range {corr[idx].min().item():.3f} .. {corr[idx].max().item():.3f})")
+    return DataTensor(ref.tensor[idx], center=ref.center,
+                      IWA=ref.IWA, OWA=ref.OWA)
+
+
 class TorchKLIP:
     """
     High-level wrapper to run PSF subtraction and derotation.
@@ -813,6 +911,15 @@ class TorchKLIP:
                 f"Applying circular mask with IWA={self.IWA}, OWA={self.OWA}")
             self.datacube.mask_circular_(self.IWA, self.OWA)
 
+        # RDI / hybrid: put the reference library on the same pixel set as the
+        # (now masked) science cube.  Without this the KL basis is dominated by
+        # pixels (e.g. inside the IWA) that the science frames have zeroed out.
+        if self.ref_datacube is not None:
+            _share_nan_mask(self.datacube, self.ref_datacube)
+            logger.info(
+                f"Reference library: {self.ref_datacube.nk} frames; "
+                "science NaN mask applied")
+
     def _log_metrics(self):
         m = self.metrics
         logger.info("=== Performance Metrics ===")
@@ -838,6 +945,7 @@ class TorchKLIP:
                           annular_exclusion: float = 0.0,
                           pa_reuse_threshold: float = 0.5,
                           hybrid_weight: float = 1.0,
+                          normalize_ref: bool = False,
                           ) -> Union[torch.Tensor,
                                      Tuple[torch.Tensor, KLIPDiagnostics]]:
         """
@@ -896,6 +1004,9 @@ class TorchKLIP:
                 per-frame weight.  Increase above ``1.0`` to prevent a
                 large reference library from dominating the SVD.
                 Has no effect in ``adi`` or ``rdi`` mode.
+            normalize_ref: ``rdi`` mode only.  L2-normalise each reference
+                frame before building the KL basis.  Default ``False``.
+                (``hybrid`` mode always normalises.)
 
         Returns:
             * Default: 2D tensor ``(ny, nx)`` for single K, or 3D tensor
@@ -927,6 +1038,25 @@ class TorchKLIP:
             f"statistic={statistic}, mode={mode}"
         )
 
+        # For rdi/hybrid: if the reference has NaN pixels that are valid in the
+        # science cube, mask those pixels in a working copy of the science so
+        # both sides use exactly the same pixel set.  (ADI is untouched.)
+        sci_dc = self.datacube
+        if mode in ("rdi", "hybrid") and self.ref_datacube is not None:
+            extra = (torch.isnan(self.ref_datacube.tensor).any(dim=0)
+                     & ~torch.isnan(self.datacube.tensor).any(dim=0))
+            if extra.any():
+                logger.warning(
+                    f"{int(extra.sum())} pixels are NaN in the reference but "
+                    "valid in the science cube; masking them in the science "
+                    "working copy.")
+                sci_dc = DataTensor(self.datacube.tensor.clone(),
+                                    center=self.datacube.center,
+                                    IWA=self.datacube.IWA,
+                                    OWA=self.datacube.OWA,
+                                    copy=False)
+                sci_dc.tensor[:, extra] = float("nan")
+
         # 1. PSF subtraction ------------------------------------------------
         self.perfmon.start_timer("total")
         self.perfmon.start_timer("psfsub")
@@ -939,7 +1069,7 @@ class TorchKLIP:
                 )
             if return_diagnostics:
                 residuals, diagnostics = compute_residuals_hybrid(
-                    self.datacube, k_list, self.angles, method,
+                    sci_dc, k_list, self.angles, method,
                     annular_exclusion=annular_exclusion,
                     pa_reuse_threshold=pa_reuse_threshold,
                     return_diagnostics=True,
@@ -949,7 +1079,7 @@ class TorchKLIP:
                 self.diagnostics = diagnostics
             else:
                 residuals = compute_residuals_hybrid(
-                    self.datacube, k_list, self.angles, method,
+                    sci_dc, k_list, self.angles, method,
                     annular_exclusion=annular_exclusion,
                     pa_reuse_threshold=pa_reuse_threshold,
                     ref_datacube=self.ref_datacube,
@@ -960,14 +1090,16 @@ class TorchKLIP:
             ref_dc = self.ref_datacube if mode == "rdi" else None
             if return_diagnostics:
                 residuals, diagnostics = compute_residuals(
-                    self.datacube, k_list, method,
+                    sci_dc, k_list, method,
                     return_diagnostics=True, ref_datacube=ref_dc,
+                    normalize_ref=normalize_ref,
                 )
                 self.diagnostics = diagnostics
             elif self.store_intermediates:
                 out = compute_residuals(
-                    self.datacube, k_list, method,
+                    sci_dc, k_list, method,
                     store_intermediates=True, ref_datacube=ref_dc,
+                    normalize_ref=normalize_ref,
                 )
                 if isinstance(out, ResidualsWithIntermediates):
                     residuals = out.residuals
@@ -980,7 +1112,8 @@ class TorchKLIP:
                 self.residuals = residuals
             else:
                 residuals = compute_residuals(
-                    self.datacube, k_list, method, ref_datacube=ref_dc,
+                    sci_dc, k_list, method, ref_datacube=ref_dc,
+                    normalize_ref=normalize_ref,
                 )
 
         self.perfmon.stop_timer("psfsub")
@@ -1018,4 +1151,5 @@ class TorchKLIP:
         return result
 
 
-__all__ = ["TorchKLIP", "KLIPDiagnostics", "compute_residuals_hybrid"]
+__all__ = ["TorchKLIP", "KLIPDiagnostics", "compute_residuals_hybrid",
+           "select_reference_frames"]
