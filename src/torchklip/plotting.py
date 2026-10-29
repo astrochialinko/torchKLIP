@@ -150,7 +150,7 @@ def plot_residual_multi_planet(
     snr_dict: Dict[str, float] = {lbl: v[0] for lbl, v in snr_components.items()}
 
     if shared_colorbar:
-        std = np.std(combined)
+        std = np.nanstd(combined)
         vmin, vmax = -3 * std, 3 * std
     else:
         lo, hi = np.nanpercentile(combined, [1, 99])
@@ -223,6 +223,7 @@ def plot_method_comparison(
     k_list: List[int],
     planets: List[dict],
     output_dir: Path,
+    title_suffix: str = "",
 ) -> None:
     """Plot SNR vs K for multiple KLIP modes on shared axes.
 
@@ -230,10 +231,11 @@ def plot_method_comparison(
     across modes so per-planet trends are visually groupable.
 
     Args:
-        all_snr   : Nested dict ``{mode: {planet_label: {k: snr}}}``.
-        k_list    : Ordered list of K values (shared across modes).
-        planets   : List of ``{"label", "color"}`` dicts.
-        output_dir: Directory to write the PNG.
+        all_snr     : Nested dict ``{mode: {planet_label: {k: snr}}}``.
+        k_list      : Ordered list of K values (shared across modes).
+        planets     : List of ``{"label", "color"}`` dicts.
+        output_dir  : Directory to write the PNG.
+        title_suffix: Optional text appended to the plot title (e.g. a dataset name).
     """
     from matplotlib.lines import Line2D
 
@@ -277,7 +279,7 @@ def plot_method_comparison(
     ax.legend(handles=handles + style_handles, loc="best", fontsize=8, framealpha=0.7)
 
     modes_str = " vs ".join(m.upper() for m in all_snr)
-    ax.set_title(f"{modes_str}: SNR vs K  [OS11 HLC]", fontsize=11)
+    ax.set_title(f"{modes_str}: SNR vs K  {title_suffix}".strip(), fontsize=11)
     ax.set_xlabel("K  (number of KL modes)")
     ax.set_ylabel("SNR")
     ax.grid(True, linestyle="--", alpha=0.6)
