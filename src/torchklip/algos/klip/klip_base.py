@@ -397,18 +397,20 @@ def compute_residuals_hybrid(
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, KLIPDiagnostics]]:
     """Compute PSF-subtracted residuals in ADI+RDI hybrid (``'hybrid'``) mode.
 
-    For each PA batch the reference library is assembled as
+    For each PA batch :math:`B` the reference library is assembled as
 
     .. math::
 
-        \\mathcal{L} = \\mathcal{R}_{\\text{ref}}
-                       \\cup
-                       \\bigl\\{ I_j : |\\text{PA}_j - \\text{PA}_{\\text{rep}}|
-                                        > \\delta_{\\text{excl}} \\bigr\\}
+        \\mathcal{L}_B = \\mathcal{R}_{\\text{ref}}
+                         \\cup
+                         \\bigl\\{ I_j : j \\notin B,\\;
+                                   \\min_{i \\in B} |\\text{PA}_j - \\text{PA}_i|
+                                   > \\delta_{\\text{excl}} \\bigr\\}
 
-    where :math:`\\text{PA}_{\\text{rep}}` is the parallactic angle of the first
-    frame in the batch, :math:`\\delta_{\\text{excl}}` is *annular_exclusion*,
-    and :math:`\\mathcal{R}_{\\text{ref}}` is the external reference library
+    where a target frame :math:`I_j` is eligible only if it is not in the batch
+    and its PA differs by more than :math:`\\delta_{\\text{excl}}`
+    (*annular_exclusion*) from every frame in the batch, and
+    :math:`\\mathcal{R}_{\\text{ref}}` is the external reference library
     (empty when *ref_datacube* is ``None``).
 
     A single KL basis is shared by all frames whose PA lies within
@@ -422,11 +424,16 @@ def compute_residuals_hybrid(
             Must reside on the same device as ``datacube``.
         method: Basis computation strategy — ``'svd'``, ``'pca'``, or
             ``'eigh'``.  Defaults to ``'svd'``.
-        annular_exclusion: Angular exclusion half-width in degrees.  Target
-            frames whose PA separation from the batch representative is at most
-            this value are excluded from the self-reference subset of the
-            library.  ``0.0`` (default) excludes only frames with exactly the
-            same PA as the representative.
+        annular_exclusion: Angular exclusion in degrees.  A target frame enters
+            a batch's KL library only if its PA differs by more than this value
+            from every frame in the batch; the batch's own frames are always
+            excluded.  At separation ``r`` (pixels) a PA change ``Δθ`` moves the
+            planet by about ``r * radians(Δθ)`` pixels, so requiring a motion of
+            ``N`` FWHM at the innermost separation of interest corresponds to
+            ``annular_exclusion = degrees(N * FWHM / r)`` (e.g. ``N=1``,
+            ``FWHM=3`` px, ``r=20`` px gives about 8.6 deg).  ``0.0`` (default)
+            excludes only the batch itself and gives little protection against
+            planet self-subtraction; a warning is logged in that case.
         pa_reuse_threshold: PA change (degrees) that triggers a new SVD
             computation.  All frames within the same batch share a single KL
             basis.  Default ``0.5`` deg.
@@ -467,6 +474,13 @@ def compute_residuals_hybrid(
 
     K_list = _normalize_and_validate_K(K_klip, max_lib_size, logger)
     K_max = K_list[-1]
+
+    if annular_exclusion <= 0:
+        logger.warning(
+            "Hybrid: annular_exclusion=0 excludes only the current PA batch from "
+            "its own KL library; target frames at nearby PA may cause planet "
+            "self-subtraction.  See the annular_exclusion docstring for guidance."
+        )
 
     # Capture temporal mean before in-place mean subtraction
     if return_diagnostics:
@@ -527,6 +541,9 @@ def compute_residuals_hybrid(
 
     # Preserved from the last batch for KLIPDiagnostics
     Z_KL_last: Optional[torch.Tensor] = None
+    # Track PA groups whose library is smaller than K_max
+    n_clamped = 0
+    min_lib_size = K_max
 
     for grp_idx, group in enumerate(pa_groups):
         # Representative PA: use the first frame of the batch
@@ -576,6 +593,8 @@ def compute_residuals_hybrid(
         # SVD rank cannot exceed the number of library frames
         k_max_eff = min(K_max, lib.shape[0])
         if k_max_eff < K_max:
+            n_clamped += 1
+            min_lib_size = min(min_lib_size, lib.shape[0])
             logger.debug(
                 f"Hybrid group {grp_idx}: clamping K_max {K_max} → {k_max_eff} "
                 f"(library size={lib.shape[0]}, PA_rep={rep_pa:.2f} deg)"
@@ -607,6 +626,13 @@ def compute_residuals_hybrid(
             # (zero-padded to K_max when k_max_eff < K_max)
             if k == K_list[-1]:
                 coefficients_out[group, :k_eff] = proj
+
+    if n_clamped:
+        logger.warning(
+            f"Hybrid: K_max={K_max} exceeds the KL library size in "
+            f"{n_clamped}/{len(pa_groups)} PA groups (smallest library: "
+            f"{min_lib_size} frames); those groups use fewer KL modes than requested."
+        )
 
     # Restore NaN positions (NaNs survive mean_subtract_() in-place)
     logger.debug("Hybrid: restoring NaN mask")
@@ -968,7 +994,12 @@ class TorchKLIP:
             isbatch: Whether to use batch rotation.
             mode: Processing mode:
 
-                * ``"adi"`` — self-reference (classic ADI).
+                * ``"adi"`` — full-frame self-reference ADI: one KL basis is
+                  built from all science frames, including the frame being
+                  subtracted, with no angular exclusion.  Planet throughput
+                  therefore falls as K approaches the number of frames.  For
+                  ADI with angular exclusion, use ``"hybrid"`` without
+                  ``ref_data``.
                 * ``"rdi"`` — external reference library supplied via
                   ``ref_data`` at construction time.
                 * ``"hybrid"`` — ADI + RDI combined. For each PA batch the KL
