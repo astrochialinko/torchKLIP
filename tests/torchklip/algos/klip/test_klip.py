@@ -365,6 +365,10 @@ def test_compute_residuals_return_diagnostics(synthetic_datacube):
     nk, ny, nx = datacube.nk, datacube.ny, datacube.nx
     K_klip = [1, 3]
 
+    # Expected: each frame minus its own spatial mean (KLIP pre-processing)
+    x = datacube.tensor.clone()
+    expected = x - torch.nanmean(x.flatten(1), dim=1).view(-1, 1, 1)
+
     result = compute_residuals(datacube, K_klip, return_diagnostics=True)
     assert isinstance(result, tuple) and len(result) == 2
 
@@ -386,12 +390,12 @@ def test_compute_residuals_return_diagnostics(synthetic_datacube):
     # residual_frames must equal returned residuals tensor
     assert torch.allclose(diag.residual_frames, residuals, equal_nan=True)
 
-    # residuals + psf_estimates ≈ mean-subtracted input (allowing for float rounding)
-    # Use the larger-K slice (last entry)
-    combined = diag.residual_frames[-1] + diag.psf_estimates[-1]
-    # Where neither is NaN, the sum should be close to mean-subtracted data
-    valid = ~torch.isnan(combined)
-    assert valid.any()
+    # residuals + PSF model must reconstruct the mean-subtracted input, for every K
+    for i in range(len(K_klip)):
+        torch.testing.assert_close(
+            diag.residual_frames[i] + diag.psf_estimates[i], expected,
+            atol=1e-5, rtol=1e-5, equal_nan=True,
+        )
 
 
 def test_compute_residuals_diagnostics_single_k(synthetic_datacube):
@@ -560,6 +564,10 @@ def test_hybrid_mode_diagnostics(synthetic_datacube):
     nk, ny, nx = datacube.nk, datacube.ny, datacube.nx
     K_list = [1, 3]
 
+    # Expected: each frame minus its own spatial mean (KLIP pre-processing)
+    x = datacube.tensor.clone()
+    expected = x - torch.nanmean(x.flatten(1), dim=1).view(-1, 1, 1)
+
     result = compute_residuals_hybrid(
         datacube, K_list, angles, return_diagnostics=True
     )
@@ -582,10 +590,12 @@ def test_hybrid_mode_diagnostics(synthetic_datacube):
     # residual_frames must equal the returned residuals tensor
     assert torch.allclose(diag.residual_frames, residuals, equal_nan=True)
 
-    # residuals + psf_estimates ≈ mean-subtracted input
-    combined = diag.residual_frames[-1] + diag.psf_estimates[-1]
-    valid = ~torch.isnan(combined)
-    assert valid.any()
+    # residuals + PSF model must reconstruct the mean-subtracted input, for every K
+    for i in range(len(K_list)):
+        torch.testing.assert_close(
+            diag.residual_frames[i] + diag.psf_estimates[i], expected,
+            atol=1e-5, rtol=1e-5, equal_nan=True,
+        )
 
 
 def test_torchklip_hybrid_mode(synthetic_datacube):
@@ -849,7 +859,7 @@ def test_select_reference_frames_validation(rdi_planet_data):
     with pytest.raises(ValueError):
         select_reference_frames(sci, ref, n_keep=0)
     assert select_reference_frames(sci, ref, n_keep=999).nk == ref.nk
-    
+
 if __name__ == "__main__":
     # This allows running the tests directly
     pytest.main(["-xvs", __file__])
