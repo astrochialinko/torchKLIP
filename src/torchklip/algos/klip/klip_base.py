@@ -64,9 +64,10 @@ class KLIPDiagnostics:
     Attributes:
         kl_basis: KL-mode eigenimages of shape ``(K_max, ny, nx)``.
             ``kl_basis[i]`` is the (i+1)-th KL mode image.
-        mean_frame: Temporal mean of the input datacube, shape ``(ny, nx)``.
-            This is the average frame over all exposures before KLIP subtraction
-            and represents the common stellar PSF structure.
+        mean_frame: Temporal mean of the input datacube, shape ``(ny, nx)``,
+            computed before any processing.  Provided for visualisation of the
+            average stellar PSF; note that KLIP itself subtracts each frame's
+            spatial mean, not this temporal mean.
         psf_estimates: Reconstructed stellar PSF per K value,
             shape ``(n_K, nk, ny, nx)``.  ``psf_estimates[i]`` is the PSF
             model built from ``K_list[i]`` KL modes for every input frame.
@@ -182,9 +183,9 @@ def compute_residuals(datacube: DataTensor,
             (identical to the previous behaviour).
 
     Note:
-        ``datacube`` and ``ref_datacube`` are mean-subtracted **in place**.
-        ``TorchKLIP`` passes private copies, so this only matters when
-        calling :func:`compute_residuals` directly.
+        ``datacube`` and ``ref_datacube`` are mean-subtracted **in place**
+        (frame-wise spatial mean).  The operation is idempotent, so repeated
+        calls on the same objects give the same residuals.
 
     Returns:
         * Default (both flags False): Tensor of shape ``(n_k_values, nk, ny, nx)``.
