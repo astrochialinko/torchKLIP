@@ -337,6 +337,10 @@ def _normalize_library(frames: torch.Tensor, eps: float = 1e-10) -> torch.Tensor
     norms = torch.clamp(norms, min=eps)
     return frames / norms
 
+def _pa_distance(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Smallest absolute angular difference in degrees, handling 0/360 wrap."""
+    return torch.abs(torch.remainder(a - b + 180.0, 360.0) - 180.0)
+
 def _group_frames_by_pa(
     angles: torch.Tensor,
     pa_reuse_threshold: float = 0.5,
@@ -528,9 +532,13 @@ def compute_residuals_hybrid(
         rep_pa: float = angles[group[0]].item()
         g = len(group)
 
-        # Boolean mask of valid target frames for this batch's library
-        pa_diff = torch.abs(angles - rep_pa)              # (nk,)
-        valid_mask: torch.Tensor = pa_diff > annular_exclusion  # (nk,) bool
+        # A target frame may enter this batch's library only if it is farther
+        # than annular_exclusion from EVERY frame in the batch, and the batch's
+        # own frames are always excluded, so no frame is fitted with itself.
+        group_idx = torch.tensor(group, device=angles.device)
+        dist = _pa_distance(angles.unsqueeze(1), angles[group_idx].unsqueeze(0))  # (nk, g)
+        valid_mask: torch.Tensor = dist.min(dim=1).values > annular_exclusion     # (nk,)
+        valid_mask[group_idx] = False
         n_valid: int = int(valid_mask.sum().item())
 
         # Assemble the combined library for SVD using normalized frames.
@@ -548,18 +556,15 @@ def compute_residuals_hybrid(
             )
 
         if not lib_parts_norm:
-            # Degenerate edge case: annular_exclusion so wide that the entire
-            # target falls inside the exclusion zone with no reference library.
-            # Fall back to normalized full target to avoid a crash.
-            logger.warning(
-                f"Hybrid group {grp_idx}: empty library for "
-                f"PA_rep={rep_pa:.2f} deg, "
-                f"annular_exclusion={annular_exclusion} deg. "
-                "Falling back to normalized full target library."
+            error_msg = (
+                f"Hybrid group {grp_idx}: empty KL library for "
+                f"PA_rep={rep_pa:.2f} deg with annular_exclusion="
+                f"{annular_exclusion} deg and no reference library. "
+                "Reduce annular_exclusion or provide ref_data."
             )
-            lib = target_flat_norm * hybrid_weight
-        else:
-            lib = torch.cat(lib_parts_norm, dim=0)         # (n_lib, ny*nx)
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+        lib = torch.cat(lib_parts_norm, dim=0)             # (n_lib, ny*nx)
 
         logger.debug(
             f"Hybrid group {grp_idx}: basis lib n_rows={lib.shape[0]} "

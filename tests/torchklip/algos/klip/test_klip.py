@@ -512,22 +512,28 @@ def test_hybrid_mode_all_methods(synthetic_datacube):
 
 
 def test_hybrid_mode_angular_exclusion(synthetic_datacube):
-    """Increasing annular_exclusion shrinks the target sub-library."""
+    """annular_exclusion controls which target frames enter the KL library."""
     datacube, angles = synthetic_datacube
     nk, ny, nx = datacube.nk, datacube.ny, datacube.nx
 
-    # With exclusion = 0, all frames with non-identical PA are included
+    # exclusion = 0: every frame outside the current PA batch is eligible
     res_no_excl = compute_residuals_hybrid(
         datacube, 3, angles, annular_exclusion=0.0
     )
-    # With very wide exclusion (> max PA spread), no target frames qualify;
-    # the function falls back to the full target library (logged warning)
-    res_wide_excl = compute_residuals_hybrid(
-        datacube, 3, angles, annular_exclusion=360.0
-    )
-    # Both should have the correct shape
     assert res_no_excl.shape == (1, nk, ny, nx)
-    assert res_wide_excl.shape == (1, nk, ny, nx)
+
+    # Exclusion wider than any possible PA separation and no reference library:
+    # the KL library is empty, which must raise rather than self-subtract.
+    with pytest.raises(ValueError, match="empty KL library"):
+        compute_residuals_hybrid(datacube, 3, angles, annular_exclusion=360.0)
+
+    # The same wide exclusion is fine when a reference library is supplied:
+    # the basis is then built from the reference frames alone (pure RDI).
+    ref_dc = DataTensor(torch.randn(4, ny, nx))
+    res_ref_only = compute_residuals_hybrid(
+        datacube, 3, angles, annular_exclusion=360.0, ref_datacube=ref_dc
+    )
+    assert res_ref_only.shape == (1, nk, ny, nx)
 
 
 def test_hybrid_mode_with_reference(synthetic_datacube):
@@ -656,6 +662,27 @@ def test_torchklip_hybrid_nan_restoration(synthetic_datacube):
     # The NaN position must be propagated
     assert torch.isnan(residuals[:, :, 0, 0]).all()
 
+def test_hybrid_excludes_batch_members_from_library():
+    """No frame may be fitted with itself or a batch neighbour.
+
+    Two PA batches of three frames each. With annular_exclusion=0 and K equal
+    to the library size, any frame that sits in its own library would be
+    reconstructed almost perfectly, driving its residual towards zero.
+    Independent random frames should instead keep most of their norm.
+    """
+    torch.manual_seed(0)
+    nk, ny, nx = 6, 32, 32
+    cube = torch.randn(nk, ny, nx)
+    angles = torch.tensor([0.0, 0.1, 0.2, 10.0, 10.1, 10.2])
+
+    residuals = compute_residuals_hybrid(
+        DataTensor(cube.clone()), 5, angles,
+        annular_exclusion=0.0, pa_reuse_threshold=0.5,
+    )
+
+    res_norm = residuals[0].flatten(1).norm(dim=1)
+    in_norm = cube.flatten(1).norm(dim=1)
+    assert torch.all(res_norm > 0.5 * in_norm), res_norm / in_norm
 
 if __name__ == "__main__":
     # This allows running the tests directly
