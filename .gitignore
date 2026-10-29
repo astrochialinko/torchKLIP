@@ -27,10 +27,6 @@ temp/
 # Pytest cache
 .pytest_cache/
 
-# claude-specific files
-.claudeignore
-CLAUDE.md
-
 # Ignore all files in logs/, data/, and outputs/ directories
 logs/*
 data/*
