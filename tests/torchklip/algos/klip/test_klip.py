@@ -3,6 +3,7 @@ import pytest
 import torch
 import numpy as np
 from typing import Tuple
+from scipy.ndimage import gaussian_filter
 
 # Import the modules to test
 from torchklip.algos.klip.svd import compute_basis_svd
@@ -19,6 +20,7 @@ from torchklip.algos.klip.klip_base import (
     TorchKLIP,
     ResidualsWithIntermediates,
     KLIPDiagnostics,
+    select_reference_frames,
 )
 from torchklip.dataproc.data_preprocessor import DataTensor
 from torchklip.utils.logging_utils import get_logger
@@ -684,6 +686,170 @@ def test_hybrid_excludes_batch_members_from_library():
     in_norm = cube.flatten(1).norm(dim=1)
     assert torch.all(res_norm > 0.5 * in_norm), res_norm / in_norm
 
+# ---------------------------------------------------------------------------
+# RDI tests with an injected fake planet
+# ---------------------------------------------------------------------------
+
+_PL_SEP = 10.0      # planet separation (pixels)
+_PL_SIGMA = 1.5     # planet Gaussian sigma (pixels)
+_PL_AMP = 0.3       # planet peak amplitude
+_PL_APERTURE = 3.0  # photometry aperture radius (pixels)
+
+
+def _planet_xy(angle_deg: float, cy: float, cx: float) -> Tuple[float, float]:
+    theta = np.deg2rad(angle_deg)
+    return cx + _PL_SEP * np.cos(theta), cy + _PL_SEP * np.sin(theta)
+
+
+@pytest.fixture
+def rdi_planet_data():
+    """Science and reference cubes sharing the same stellar PSF structure.
+
+    Every stellar frame is a base PSF plus a random combination of four
+    smooth speckle modes, so the reference library spans the science PSF.
+    Only the science cube contains a planet, whose position rotates with PA.
+    """
+    rng = np.random.default_rng(0)
+    ny = nx = 41
+    cy = cx = 20
+    y, x = np.mgrid[:ny, :nx]
+    r = np.hypot(y - cy, x - cx)
+
+    psf0 = np.exp(-r**2 / (2 * 3.0**2)) + 0.2 * np.exp(-(r - 8)**2 / (2 * 1.5**2))
+    modes = [gaussian_filter(rng.standard_normal((ny, nx)), 3) for _ in range(4)]
+    modes = [m / np.abs(m).max() * 0.05 for m in modes]
+
+    def stellar_frames(n):
+        return np.stack([
+            psf0 * (1 + 0.05 * rng.standard_normal())
+            + sum(rng.standard_normal() * m for m in modes)
+            + 0.002 * rng.standard_normal((ny, nx))
+            for _ in range(n)
+        ])
+
+    nk, n_ref = 8, 20
+    angles = np.arange(nk) * 10.0
+
+    planet = np.zeros((nk, ny, nx))
+    for i, a in enumerate(angles):
+        px, py = _planet_xy(a, cy, cx)
+        planet[i] = _PL_AMP * np.exp(-((x - px)**2 + (y - py)**2) / (2 * _PL_SIGMA**2))
+
+    to_t = lambda a: torch.tensor(a, dtype=torch.float32)
+    return {
+        "sci": to_t(stellar_frames(nk) + planet),
+        "ref": to_t(stellar_frames(n_ref)),
+        "planet": to_t(planet),
+        "angles": to_t(angles),
+        "center": (cy, cx),
+    }
+
+
+def _planet_throughput(residuals: torch.Tensor, data: dict) -> torch.Tensor:
+    """Per-frame ratio of recovered to injected planet flux in an aperture.
+
+    Args:
+        residuals: ``(nk, ny, nx)`` PSF-subtracted frames before derotation.
+        data: Output of the ``rdi_planet_data`` fixture.
+
+    Returns:
+        ``(nk,)`` tensor of throughputs (1.0 means the planet is fully kept).
+    """
+    cy, cx = data["center"]
+    ny, nx = residuals.shape[-2:]
+    yy, xx = torch.meshgrid(torch.arange(ny), torch.arange(nx), indexing="ij")
+    out = []
+    for i, a in enumerate(data["angles"].tolist()):
+        px, py = _planet_xy(a, cy, cx)
+        ap = torch.hypot(xx - px, yy - py) <= _PL_APERTURE
+        out.append(residuals[i][ap].sum() / data["planet"][i][ap].sum())
+    return torch.stack(out)
+
+
+@pytest.mark.parametrize("method", ["svd", "pca", "eigh"])
+def test_rdi_preserves_planet(rdi_planet_data, method):
+    """RDI removes the star but keeps nearly all of the planet flux."""
+    d = rdi_planet_data
+    residuals = compute_residuals(
+        DataTensor(d["sci"].clone()), [5, 10], method,
+        ref_datacube=DataTensor(d["ref"].clone()),
+    )
+    for k_idx in range(residuals.shape[0]):
+        thr = _planet_throughput(residuals[k_idx], d)
+        assert thr.mean() > 0.85, thr
+        assert thr.min() > 0.75, thr
+
+
+def test_rdi_normalize_ref_preserves_planet(rdi_planet_data):
+    """normalize_ref changes only the basis weighting, not planet throughput."""
+    d = rdi_planet_data
+    residuals = compute_residuals(
+        DataTensor(d["sci"].clone()), 10,
+        ref_datacube=DataTensor(d["ref"].clone()), normalize_ref=True,
+    )
+    assert _planet_throughput(residuals[0], d).mean() > 0.85
+
+
+def test_rdi_k_bounded_by_reference_size(rdi_planet_data):
+    """In RDI mode K may exceed the number of science frames but not refs."""
+    d = rdi_planet_data
+    n_ref = d["ref"].shape[0]
+    # K larger than nk (8) but within n_ref (20) is allowed
+    compute_residuals(DataTensor(d["sci"].clone()), 15,
+                      ref_datacube=DataTensor(d["ref"].clone()))
+    with pytest.raises(ValueError):
+        compute_residuals(DataTensor(d["sci"].clone()), n_ref + 1,
+                          ref_datacube=DataTensor(d["ref"].clone()))
+
+
+def test_hybrid_outperforms_full_frame_adi_at_high_k(rdi_planet_data):
+    """Hybrid with exclusion keeps the planet where full-frame ADI loses it."""
+    d = rdi_planet_data
+    nk = d["sci"].shape[0]
+
+    adi = compute_residuals(DataTensor(d["sci"].clone()), nk - 1)
+    hyb = compute_residuals_hybrid(
+        DataTensor(d["sci"].clone()), 15, d["angles"],
+        annular_exclusion=15.0, ref_datacube=DataTensor(d["ref"].clone()),
+    )
+    thr_adi = _planet_throughput(adi[0], d).mean()
+    thr_hyb = _planet_throughput(hyb[0], d).mean()
+
+    assert thr_adi < 0.2, thr_adi    # documents full-frame ADI self-subtraction
+    assert thr_hyb > 0.6, thr_hyb
+    assert thr_hyb > thr_adi
+
+
+def test_torchklip_rdi_requires_reference(rdi_planet_data):
+    """mode='rdi' without ref_data raises a clear error."""
+    d = rdi_planet_data
+    klip = TorchKLIP(DataTensor(d["sci"].clone()), d["angles"])
+    with pytest.raises(ValueError, match="ref_data"):
+        klip.klip_and_derotate(5, mode="rdi")
+
+
+def test_select_reference_frames_prefers_correlated(rdi_planet_data):
+    """PSF-like reference frames are chosen over pure-noise frames."""
+    d = rdi_planet_data
+    good = d["ref"][:5]
+    bad = torch.randn_like(good) * good.std()
+    ref = DataTensor(torch.cat([bad, good]))
+
+    selected = select_reference_frames(DataTensor(d["sci"].clone()), ref, n_keep=5)
+    assert selected.nk == 5
+    for frame in selected.tensor:
+        assert any(torch.allclose(frame, g) for g in good)
+
+
+def test_select_reference_frames_validation(rdi_planet_data):
+    """n_keep is validated and clipped to the library size."""
+    d = rdi_planet_data
+    sci = DataTensor(d["sci"].clone())
+    ref = DataTensor(d["ref"].clone())
+    with pytest.raises(ValueError):
+        select_reference_frames(sci, ref, n_keep=0)
+    assert select_reference_frames(sci, ref, n_keep=999).nk == ref.nk
+    
 if __name__ == "__main__":
     # This allows running the tests directly
     pytest.main(["-xvs", __file__])
