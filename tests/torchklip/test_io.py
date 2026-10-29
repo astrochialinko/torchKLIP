@@ -27,3 +27,12 @@ def test_save_fits_outputs(tmp_path):
     with fits.open(tmp_path / "test_kl_basis.fits") as hdul:
         assert hdul[0].data.shape == (5, 8, 10)
         assert hdul[0].header["KMAX"] == 5
+
+def test_save_fits_outputs_creates_dir_and_sets_bunit(tmp_path):
+    out = tmp_path / "nested" / "dir"
+    result = np.zeros((1, 4, 4))
+    kl_basis = np.zeros((2, 4, 4))
+    save_fits_outputs(result, kl_basis, [2], str(out), label="t",
+                      method="svd", mode="adi", bunit="contrast")
+    with fits.open(out / "t_residuals_cube.fits") as hdul:
+        assert hdul[0].header["BUNIT"] == "contrast"
