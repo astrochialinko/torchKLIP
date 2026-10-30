@@ -3,6 +3,7 @@ import pytest
 import torch
 import numpy as np
 from typing import Tuple
+from scipy.ndimage import gaussian_filter
 
 # Import the modules to test
 from torchklip.algos.klip.svd import compute_basis_svd
@@ -10,12 +11,16 @@ from torchklip.algos.klip.pca import compute_basis_pca
 from torchklip.algos.klip.eigh import compute_basis_eigh
 from torchklip.algos.klip.klip_base import (
     _normalize_and_validate_K,
+    _group_frames_by_pa,
     compute_residuals,
+    compute_residuals_hybrid,
     batch_rotate,
     derotate_cube,
     combine_cube,
     TorchKLIP,
-    ResidualsWithIntermediates
+    ResidualsWithIntermediates,
+    KLIPDiagnostics,
+    select_reference_frames,
 )
 from torchklip.dataproc.data_preprocessor import DataTensor
 from torchklip.utils.logging_utils import get_logger
@@ -353,6 +358,507 @@ def test_ResidualsWithIntermediates():
     assert torch.all(i == ihat)
     assert torch.all(rf == residual_flat)
 
+
+def test_compute_residuals_return_diagnostics(synthetic_datacube):
+    """Test compute_residuals with return_diagnostics=True."""
+    datacube, _ = synthetic_datacube
+    nk, ny, nx = datacube.nk, datacube.ny, datacube.nx
+    K_klip = [1, 3]
+
+    # Expected: each frame minus its own spatial mean (KLIP pre-processing)
+    x = datacube.tensor.clone()
+    expected = x - torch.nanmean(x.flatten(1), dim=1).view(-1, 1, 1)
+
+    result = compute_residuals(datacube, K_klip, return_diagnostics=True)
+    assert isinstance(result, tuple) and len(result) == 2
+
+    residuals, diag = result
+    assert isinstance(diag, KLIPDiagnostics)
+
+    K_max = max(K_klip)
+    n_K = len(K_klip)
+
+    # Shape checks
+    assert residuals.shape == (n_K, nk, ny, nx)
+    assert diag.kl_basis.shape == (K_max, ny, nx)
+    assert diag.mean_frame.shape == (ny, nx)
+    assert diag.psf_estimates.shape == (n_K, nk, ny, nx)
+    assert diag.residual_frames.shape == (n_K, nk, ny, nx)
+    assert diag.coefficients.shape == (nk, K_max)
+    assert diag.K_list == sorted(K_klip)
+
+    # residual_frames must equal returned residuals tensor
+    assert torch.allclose(diag.residual_frames, residuals, equal_nan=True)
+
+    # residuals + PSF model must reconstruct the mean-subtracted input, for every K
+    for i in range(len(K_klip)):
+        torch.testing.assert_close(
+            diag.residual_frames[i] + diag.psf_estimates[i], expected,
+            atol=1e-5, rtol=1e-5, equal_nan=True,
+        )
+
+
+def test_compute_residuals_diagnostics_single_k(synthetic_datacube):
+    """return_diagnostics works with a single K value."""
+    datacube, _ = synthetic_datacube
+    nk, ny, nx = datacube.nk, datacube.ny, datacube.nx
+    K_klip = 3
+
+    residuals, diag = compute_residuals(datacube, K_klip, return_diagnostics=True)
+    assert residuals.shape == (1, nk, ny, nx)
+    assert diag.kl_basis.shape == (K_klip, ny, nx)
+    assert diag.coefficients.shape == (nk, K_klip)
+    assert diag.K_list == [K_klip]
+
+
+def test_klip_and_derotate_return_diagnostics(synthetic_datacube):
+    """Test TorchKLIP.klip_and_derotate with return_diagnostics=True."""
+    datacube, angles = synthetic_datacube
+    nk, ny, nx = datacube.nk, datacube.ny, datacube.nx
+
+    klip = TorchKLIP(datacube, angles)
+
+    # Single K — result should be 2D, diagnostics present
+    result, diag = klip.klip_and_derotate(3, return_diagnostics=True)
+    assert result.shape == (ny, nx)
+    assert isinstance(diag, KLIPDiagnostics)
+    assert klip.diagnostics is diag  # also stored on instance
+
+    # Multiple K — result should be 3D
+    K_list = [1, 2, 3]
+    result, diag = klip.klip_and_derotate(K_list, return_diagnostics=True)
+    assert result.shape == (len(K_list), ny, nx)
+    assert diag.psf_estimates.shape == (len(K_list), nk, ny, nx)
+    assert diag.residual_frames.shape == (len(K_list), nk, ny, nx)
+    assert diag.kl_basis.shape == (max(K_list), ny, nx)
+    assert diag.mean_frame.shape == (ny, nx)
+    assert diag.coefficients.shape == (nk, max(K_list))
+    assert diag.K_list == sorted(K_list)
+
+
+def test_klip_and_derotate_backward_compatible(synthetic_datacube):
+    """return_diagnostics=False preserves original return type."""
+    datacube, angles = synthetic_datacube
+    ny, nx = datacube.ny, datacube.nx
+
+    klip = TorchKLIP(datacube, angles)
+    result = klip.klip_and_derotate(3)
+    assert isinstance(result, torch.Tensor)
+    assert result.shape == (ny, nx)
+
+
+def test_klip_diagnostics_public_api():
+    """KLIPDiagnostics is importable from the top-level package."""
+    import torchklip
+    assert hasattr(torchklip, "KLIPDiagnostics")
+
+
+# ---------------------------------------------------------------------------
+# Hybrid (ADI + RDI) mode tests
+# ---------------------------------------------------------------------------
+
+def test_group_frames_by_pa():
+    """_group_frames_by_pa groups consecutive frames below threshold."""
+    # Slow drift: all frames should end up in one group at threshold=1.0
+    angles = torch.tensor([0.0, 0.3, 0.6, 0.9, 1.5, 2.0])
+    groups = _group_frames_by_pa(angles, pa_reuse_threshold=1.0)
+    # Frame 4 (PA=1.5) starts a new group (|1.5-0.0| >= 1.0)
+    assert len(groups) >= 2
+    # All frames are covered without overlap
+    all_indices = sorted(idx for grp in groups for idx in grp)
+    assert all_indices == list(range(len(angles)))
+
+    # Large threshold: everything in one group
+    groups_single = _group_frames_by_pa(angles, pa_reuse_threshold=10.0)
+    assert len(groups_single) == 1
+    assert groups_single[0] == list(range(len(angles)))
+
+    # Tiny threshold: each frame in its own group
+    angles_distinct = torch.tensor([0.0, 1.0, 2.0, 3.0])
+    groups_all_split = _group_frames_by_pa(angles_distinct, pa_reuse_threshold=0.5)
+    assert len(groups_all_split) == 4
+
+    # Edge case: single frame
+    groups_one = _group_frames_by_pa(torch.tensor([45.0]), pa_reuse_threshold=1.0)
+    assert groups_one == [[0]]
+
+    # Edge case: empty
+    assert _group_frames_by_pa(torch.tensor([]), pa_reuse_threshold=1.0) == []
+
+
+def test_hybrid_mode_basic_shapes(synthetic_datacube):
+    """compute_residuals_hybrid returns correct output shapes."""
+    datacube, angles = synthetic_datacube
+    nk, ny, nx = datacube.nk, datacube.ny, datacube.nx
+
+    # Single K → shape (1, nk, ny, nx)
+    residuals = compute_residuals_hybrid(datacube, 3, angles)
+    assert residuals.shape == (1, nk, ny, nx)
+
+    # Multiple K → shape (n_K, nk, ny, nx)
+    K_list = [1, 2, 3]
+    residuals = compute_residuals_hybrid(datacube, K_list, angles)
+    assert residuals.shape == (len(K_list), nk, ny, nx)
+
+    # Output should be finite (no spurious NaN from numerical errors)
+    assert torch.isfinite(residuals).all()
+
+
+def test_hybrid_mode_all_methods(synthetic_datacube):
+    """All basis strategies work in hybrid mode."""
+    datacube, angles = synthetic_datacube
+    nk, ny, nx = datacube.nk, datacube.ny, datacube.nx
+
+    for method in ("svd", "pca", "eigh"):
+        res = compute_residuals_hybrid(datacube, 2, angles, method=method)
+        assert res.shape == (1, nk, ny, nx), f"Wrong shape for method={method}"
+
+    with pytest.raises(ValueError):
+        compute_residuals_hybrid(datacube, 2, angles, method="bad_method")
+
+
+def test_hybrid_mode_angular_exclusion(synthetic_datacube):
+    """annular_exclusion controls which target frames enter the KL library."""
+    datacube, angles = synthetic_datacube
+    nk, ny, nx = datacube.nk, datacube.ny, datacube.nx
+
+    # exclusion = 0: every frame outside the current PA batch is eligible
+    res_no_excl = compute_residuals_hybrid(
+        datacube, 3, angles, annular_exclusion=0.0
+    )
+    assert res_no_excl.shape == (1, nk, ny, nx)
+
+    # Exclusion wider than any possible PA separation and no reference library:
+    # the KL library is empty, which must raise rather than self-subtract.
+    with pytest.raises(ValueError, match="empty KL library"):
+        compute_residuals_hybrid(datacube, 3, angles, annular_exclusion=360.0)
+
+    # The same wide exclusion is fine when a reference library is supplied:
+    # the basis is then built from the reference frames alone (pure RDI).
+    ref_dc = DataTensor(torch.randn(4, ny, nx))
+    res_ref_only = compute_residuals_hybrid(
+        datacube, 3, angles, annular_exclusion=360.0, ref_datacube=ref_dc
+    )
+    assert res_ref_only.shape == (1, nk, ny, nx)
+
+
+def test_hybrid_mode_with_reference(synthetic_datacube):
+    """Hybrid mode with a reference library uses both ref and target frames."""
+    datacube, angles = synthetic_datacube
+    nk, ny, nx = datacube.nk, datacube.ny, datacube.nx
+
+    # Build a small synthetic reference library
+    ref_tensor = torch.randn(4, ny, nx)
+    ref_datacube = DataTensor(ref_tensor)
+
+    # K bounded by n_ref + nk = 4 + 5 = 9; requesting K=4 is fine
+    residuals = compute_residuals_hybrid(
+        datacube, 4, angles, ref_datacube=ref_datacube
+    )
+    assert residuals.shape == (1, nk, ny, nx)
+
+
+def test_hybrid_mode_diagnostics(synthetic_datacube):
+    """return_diagnostics=True populates KLIPDiagnostics correctly."""
+    datacube, angles = synthetic_datacube
+    nk, ny, nx = datacube.nk, datacube.ny, datacube.nx
+    K_list = [1, 3]
+
+    # Expected: each frame minus its own spatial mean (KLIP pre-processing)
+    x = datacube.tensor.clone()
+    expected = x - torch.nanmean(x.flatten(1), dim=1).view(-1, 1, 1)
+
+    result = compute_residuals_hybrid(
+        datacube, K_list, angles, return_diagnostics=True
+    )
+    assert isinstance(result, tuple) and len(result) == 2
+
+    residuals, diag = result
+    assert isinstance(diag, KLIPDiagnostics)
+
+    K_max = max(K_list)
+    n_K = len(K_list)
+
+    assert residuals.shape == (n_K, nk, ny, nx)
+    assert diag.kl_basis.shape == (K_max, ny, nx)
+    assert diag.mean_frame.shape == (ny, nx)
+    assert diag.psf_estimates.shape == (n_K, nk, ny, nx)
+    assert diag.residual_frames.shape == (n_K, nk, ny, nx)
+    assert diag.coefficients.shape == (nk, K_max)
+    assert diag.K_list == sorted(K_list)
+
+    # residual_frames must equal the returned residuals tensor
+    assert torch.allclose(diag.residual_frames, residuals, equal_nan=True)
+
+    # residuals + PSF model must reconstruct the mean-subtracted input, for every K
+    for i in range(len(K_list)):
+        torch.testing.assert_close(
+            diag.residual_frames[i] + diag.psf_estimates[i], expected,
+            atol=1e-5, rtol=1e-5, equal_nan=True,
+        )
+
+
+def test_torchklip_hybrid_mode(synthetic_datacube):
+    """TorchKLIP.klip_and_derotate with mode='hybrid' runs end-to-end."""
+    datacube, angles = synthetic_datacube
+    nk, ny, nx = datacube.nk, datacube.ny, datacube.nx
+
+    klip = TorchKLIP(datacube, angles, collect_metrics=True)
+
+    # Single K — result squeezed to 2D
+    result = klip.klip_and_derotate(3, mode="hybrid")
+    assert result.shape == (ny, nx)
+    assert isinstance(result, torch.Tensor)
+
+    # Multiple K — result is 3D
+    result_multi = klip.klip_and_derotate([1, 2, 3], mode="hybrid")
+    assert result_multi.shape == (3, ny, nx)
+
+    # With diagnostics
+    result_diag, diag = klip.klip_and_derotate(
+        [1, 3], mode="hybrid", return_diagnostics=True
+    )
+    assert result_diag.shape == (2, ny, nx)
+    assert isinstance(diag, KLIPDiagnostics)
+    assert klip.diagnostics is diag
+
+    # Metrics should still be collected
+    assert "psfsub_time" in klip.metrics
+    assert "total_time" in klip.metrics
+
+
+def test_torchklip_hybrid_with_annular_exclusion(synthetic_datacube):
+    """annular_exclusion parameter is forwarded correctly in hybrid mode."""
+    datacube, angles = synthetic_datacube
+    ny, nx = datacube.ny, datacube.nx
+
+    klip = TorchKLIP(datacube, angles)
+    result = klip.klip_and_derotate(
+        2, mode="hybrid", annular_exclusion=10.0, pa_reuse_threshold=1.0
+    )
+    assert result.shape == (ny, nx)
+
+
+def test_torchklip_hybrid_with_reference(synthetic_datacube):
+    """Hybrid mode with external reference library via TorchKLIP."""
+    datacube, angles = synthetic_datacube
+    nk, ny, nx = datacube.nk, datacube.ny, datacube.nx
+
+    ref_tensor = torch.randn(4, ny, nx)
+    ref_dc = DataTensor(ref_tensor)
+
+    klip = TorchKLIP(datacube, angles, ref_data=ref_dc)
+    result = klip.klip_and_derotate(4, mode="hybrid")
+    assert result.shape == (ny, nx)
+
+
+def test_torchklip_unsupported_mode_raises(synthetic_datacube):
+    """Unsupported mode raises NotImplementedError for all known bad inputs."""
+    datacube, angles = synthetic_datacube
+    klip = TorchKLIP(datacube, angles)
+    with pytest.raises(NotImplementedError):
+        klip.klip_and_derotate(2, mode="bad_mode")
+
+
+def test_torchklip_hybrid_nan_restoration(synthetic_datacube):
+    """NaN pixels in the input are restored in hybrid mode output."""
+    datacube, angles = synthetic_datacube
+    nk, ny, nx = datacube.nk, datacube.ny, datacube.nx
+
+    # Inject NaN pixels into a copy of the datacube
+    cube_with_nan = datacube.tensor.clone()
+    cube_with_nan[:, 0, 0] = float("nan")
+    nan_dc = DataTensor(cube_with_nan)
+
+    residuals = compute_residuals_hybrid(nan_dc, 2, angles)
+    # The NaN position must be propagated
+    assert torch.isnan(residuals[:, :, 0, 0]).all()
+
+def test_hybrid_excludes_batch_members_from_library():
+    """No frame may be fitted with itself or a batch neighbour.
+
+    Two PA batches of three frames each. With annular_exclusion=0 and K equal
+    to the library size, any frame that sits in its own library would be
+    reconstructed almost perfectly, driving its residual towards zero.
+    Independent random frames should instead keep most of their norm.
+    """
+    torch.manual_seed(0)
+    nk, ny, nx = 6, 32, 32
+    cube = torch.randn(nk, ny, nx)
+    angles = torch.tensor([0.0, 0.1, 0.2, 10.0, 10.1, 10.2])
+
+    residuals = compute_residuals_hybrid(
+        DataTensor(cube.clone()), 5, angles,
+        annular_exclusion=0.0, pa_reuse_threshold=0.5,
+    )
+
+    res_norm = residuals[0].flatten(1).norm(dim=1)
+    in_norm = cube.flatten(1).norm(dim=1)
+    assert torch.all(res_norm > 0.5 * in_norm), res_norm / in_norm
+
+# ---------------------------------------------------------------------------
+# RDI tests with an injected fake planet
+# ---------------------------------------------------------------------------
+
+_PL_SEP = 10.0      # planet separation (pixels)
+_PL_SIGMA = 1.5     # planet Gaussian sigma (pixels)
+_PL_AMP = 0.3       # planet peak amplitude
+_PL_APERTURE = 3.0  # photometry aperture radius (pixels)
+
+
+def _planet_xy(angle_deg: float, cy: float, cx: float) -> Tuple[float, float]:
+    theta = np.deg2rad(angle_deg)
+    return cx + _PL_SEP * np.cos(theta), cy + _PL_SEP * np.sin(theta)
+
+
+@pytest.fixture
+def rdi_planet_data():
+    """Science and reference cubes sharing the same stellar PSF structure.
+
+    Every stellar frame is a base PSF plus a random combination of four
+    smooth speckle modes, so the reference library spans the science PSF.
+    Only the science cube contains a planet, whose position rotates with PA.
+    """
+    rng = np.random.default_rng(0)
+    ny = nx = 41
+    cy = cx = 20
+    y, x = np.mgrid[:ny, :nx]
+    r = np.hypot(y - cy, x - cx)
+
+    psf0 = np.exp(-r**2 / (2 * 3.0**2)) + 0.2 * np.exp(-(r - 8)**2 / (2 * 1.5**2))
+    modes = [gaussian_filter(rng.standard_normal((ny, nx)), 3) for _ in range(4)]
+    modes = [m / np.abs(m).max() * 0.05 for m in modes]
+
+    def stellar_frames(n):
+        return np.stack([
+            psf0 * (1 + 0.05 * rng.standard_normal())
+            + sum(rng.standard_normal() * m for m in modes)
+            + 0.002 * rng.standard_normal((ny, nx))
+            for _ in range(n)
+        ])
+
+    nk, n_ref = 8, 20
+    angles = np.arange(nk) * 10.0
+
+    planet = np.zeros((nk, ny, nx))
+    for i, a in enumerate(angles):
+        px, py = _planet_xy(a, cy, cx)
+        planet[i] = _PL_AMP * np.exp(-((x - px)**2 + (y - py)**2) / (2 * _PL_SIGMA**2))
+
+    to_t = lambda a: torch.tensor(a, dtype=torch.float32)
+    return {
+        "sci": to_t(stellar_frames(nk) + planet),
+        "ref": to_t(stellar_frames(n_ref)),
+        "planet": to_t(planet),
+        "angles": to_t(angles),
+        "center": (cy, cx),
+    }
+
+
+def _planet_throughput(residuals: torch.Tensor, data: dict) -> torch.Tensor:
+    """Per-frame ratio of recovered to injected planet flux in an aperture.
+
+    Args:
+        residuals: ``(nk, ny, nx)`` PSF-subtracted frames before derotation.
+        data: Output of the ``rdi_planet_data`` fixture.
+
+    Returns:
+        ``(nk,)`` tensor of throughputs (1.0 means the planet is fully kept).
+    """
+    cy, cx = data["center"]
+    ny, nx = residuals.shape[-2:]
+    yy, xx = torch.meshgrid(torch.arange(ny), torch.arange(nx), indexing="ij")
+    out = []
+    for i, a in enumerate(data["angles"].tolist()):
+        px, py = _planet_xy(a, cy, cx)
+        ap = torch.hypot(xx - px, yy - py) <= _PL_APERTURE
+        out.append(residuals[i][ap].sum() / data["planet"][i][ap].sum())
+    return torch.stack(out)
+
+
+@pytest.mark.parametrize("method", ["svd", "pca", "eigh"])
+def test_rdi_preserves_planet(rdi_planet_data, method):
+    """RDI removes the star but keeps nearly all of the planet flux."""
+    d = rdi_planet_data
+    residuals = compute_residuals(
+        DataTensor(d["sci"].clone()), [5, 10], method,
+        ref_datacube=DataTensor(d["ref"].clone()),
+    )
+    for k_idx in range(residuals.shape[0]):
+        thr = _planet_throughput(residuals[k_idx], d)
+        assert thr.mean() > 0.85, thr
+        assert thr.min() > 0.75, thr
+
+
+def test_rdi_normalize_ref_preserves_planet(rdi_planet_data):
+    """normalize_ref changes only the basis weighting, not planet throughput."""
+    d = rdi_planet_data
+    residuals = compute_residuals(
+        DataTensor(d["sci"].clone()), 10,
+        ref_datacube=DataTensor(d["ref"].clone()), normalize_ref=True,
+    )
+    assert _planet_throughput(residuals[0], d).mean() > 0.85
+
+
+def test_rdi_k_bounded_by_reference_size(rdi_planet_data):
+    """In RDI mode K may exceed the number of science frames but not refs."""
+    d = rdi_planet_data
+    n_ref = d["ref"].shape[0]
+    # K larger than nk (8) but within n_ref (20) is allowed
+    compute_residuals(DataTensor(d["sci"].clone()), 15,
+                      ref_datacube=DataTensor(d["ref"].clone()))
+    with pytest.raises(ValueError):
+        compute_residuals(DataTensor(d["sci"].clone()), n_ref + 1,
+                          ref_datacube=DataTensor(d["ref"].clone()))
+
+
+def test_hybrid_outperforms_full_frame_adi_at_high_k(rdi_planet_data):
+    """Hybrid with exclusion keeps the planet where full-frame ADI loses it."""
+    d = rdi_planet_data
+    nk = d["sci"].shape[0]
+
+    adi = compute_residuals(DataTensor(d["sci"].clone()), nk - 1)
+    hyb = compute_residuals_hybrid(
+        DataTensor(d["sci"].clone()), 15, d["angles"],
+        annular_exclusion=15.0, ref_datacube=DataTensor(d["ref"].clone()),
+    )
+    thr_adi = _planet_throughput(adi[0], d).mean()
+    thr_hyb = _planet_throughput(hyb[0], d).mean()
+
+    assert thr_adi < 0.2, thr_adi    # documents full-frame ADI self-subtraction
+    assert thr_hyb > 0.6, thr_hyb
+    assert thr_hyb > thr_adi
+
+
+def test_torchklip_rdi_requires_reference(rdi_planet_data):
+    """mode='rdi' without ref_data raises a clear error."""
+    d = rdi_planet_data
+    klip = TorchKLIP(DataTensor(d["sci"].clone()), d["angles"])
+    with pytest.raises(ValueError, match="ref_data"):
+        klip.klip_and_derotate(5, mode="rdi")
+
+
+def test_select_reference_frames_prefers_correlated(rdi_planet_data):
+    """PSF-like reference frames are chosen over pure-noise frames."""
+    d = rdi_planet_data
+    good = d["ref"][:5]
+    bad = torch.randn_like(good) * good.std()
+    ref = DataTensor(torch.cat([bad, good]))
+
+    selected = select_reference_frames(DataTensor(d["sci"].clone()), ref, n_keep=5)
+    assert selected.nk == 5
+    for frame in selected.tensor:
+        assert any(torch.allclose(frame, g) for g in good)
+
+
+def test_select_reference_frames_validation(rdi_planet_data):
+    """n_keep is validated and clipped to the library size."""
+    d = rdi_planet_data
+    sci = DataTensor(d["sci"].clone())
+    ref = DataTensor(d["ref"].clone())
+    with pytest.raises(ValueError):
+        select_reference_frames(sci, ref, n_keep=0)
+    assert select_reference_frames(sci, ref, n_keep=999).nk == ref.nk
 
 if __name__ == "__main__":
     # This allows running the tests directly

@@ -1,4 +1,6 @@
 # File: src/torchklip/algos/klip/klip_base.py
+# Modified: RDI/hybrid mask consistency, optional reference normalisation,
+#           reference-frame selection, size validation.
 import time
 from dataclasses import dataclass
 from typing import Union, List, Optional, Tuple
@@ -52,6 +54,42 @@ class ResidualsWithIntermediates:
         yield self.residual_flat
 
 
+@dataclass
+class KLIPDiagnostics:
+    """Diagnostic arrays from KLIP PSF subtraction.
+
+    All spatial arrays are returned in image shape ``(ny, nx)`` rather than
+    flattened, making them directly plottable.
+
+    Attributes:
+        kl_basis: KL-mode eigenimages of shape ``(K_max, ny, nx)``.
+            ``kl_basis[i]`` is the (i+1)-th KL mode image.
+        mean_frame: Temporal mean of the input datacube, shape ``(ny, nx)``,
+            computed before any processing.  Provided for visualisation of the
+            average stellar PSF; note that KLIP itself subtracts each frame's
+            spatial mean, not this temporal mean.
+        psf_estimates: Reconstructed stellar PSF per K value,
+            shape ``(n_K, nk, ny, nx)``.  ``psf_estimates[i]`` is the PSF
+            model built from ``K_list[i]`` KL modes for every input frame.
+        residual_frames: Pre-collapse PSF-subtracted frames per K value,
+            shape ``(n_K, nk, ny, nx)``.  These are the residuals before
+            derotation and temporal combination.
+        coefficients: Projection weights of each frame onto all ``K_max`` KL
+            modes, shape ``(nk, K_max)``.  Slice ``coefficients[:, :k]`` to
+            retrieve weights for a specific ``k``.  In hybrid mode the basis
+            varies per PA batch, so coefficients reflect each frame's projection
+            onto its own batch basis (zero-padded to ``K_max`` when the
+            effective library was smaller).
+        K_list: Sorted list of K values used in this run.
+    """
+    kl_basis: torch.Tensor        # (K_max, ny, nx)
+    mean_frame: torch.Tensor      # (ny, nx)
+    psf_estimates: torch.Tensor   # (n_K, nk, ny, nx)
+    residual_frames: torch.Tensor # (n_K, nk, ny, nx)
+    coefficients: torch.Tensor    # (nk, K_max)
+    K_list: List[int]
+
+
 def _normalize_and_validate_K(K_klip: Union[int, List[int]], nk: int, logger) -> List[int]:
     """Normalizes K_klip to a sorted list of positive integers <= nk with validation.
 
@@ -103,8 +141,13 @@ def _normalize_and_validate_K(K_klip: Union[int, List[int]], nk: int, logger) ->
 def compute_residuals(datacube: DataTensor,
                       K_klip: Union[int, List[int]],
                       method: str = "svd",
-                      store_intermediates: bool = False
-                      ) -> Union[torch.Tensor, ResidualsWithIntermediates]:
+                      store_intermediates: bool = False,
+                      return_diagnostics: bool = False,
+                      ref_datacube: Optional[DataTensor] = None,
+                      normalize_ref: bool = False,
+                      ) -> Union[torch.Tensor,
+                                 ResidualsWithIntermediates,
+                                 Tuple[torch.Tensor, "KLIPDiagnostics"]]:
     """
     Compute PSF-subtracted residual cube for given KL modes.
 
@@ -112,17 +155,44 @@ def compute_residuals(datacube: DataTensor,
     to perform PSF subtraction. It computes the KL basis, projects the input frames,
     and returns the residual frames after subtracting the reconstructions.
 
+    When ``ref_datacube`` is provided the function operates in **RDI mode**: the KL
+    basis is built from the reference library and the projection/subtraction is
+    applied to the science (target) ``datacube``.  K is then bounded by the number
+    of reference frames rather than target frames.
+
     Args:
-        datacube: DataTensor containing the input frames.
+        datacube: DataTensor containing the science (target) frames.
         K_klip: Integer or list of integers specifying KL mode counts.
         method: Basis computation method, one of 'svd', 'pca', or 'eigh'.
-        store_intermediates: If True, return intermediates in a ResidualsWithIntermediates.
+        store_intermediates: If True, return flat intermediate arrays in a
+            :class:`ResidualsWithIntermediates` (only for K_max).
+            Ignored when ``return_diagnostics=True``.
+        return_diagnostics: If True, return a ``(residuals, KLIPDiagnostics)``
+            tuple containing image-shaped diagnostic arrays for every K value.
+            Takes precedence over ``store_intermediates``.
+        ref_datacube: Optional reference-star DataTensor for RDI.  When
+            supplied the KL basis is derived from these frames; ``datacube``
+            (science) is only used for projection and residual computation.
+            Its image size must match ``datacube`` and its masked (NaN) pixels
+            should be a superset of the science mask (``TorchKLIP`` ensures
+            this automatically).
+        normalize_ref: RDI only.  If True, every reference frame is scaled to
+            unit L2-norm (after mean subtraction) before the KL basis is
+            built, so bright reference frames do not dominate the covariance.
+            Projection of the science frames is unaffected.  Default False
+            (identical to the previous behaviour).
+
+    Note:
+        ``datacube`` and ``ref_datacube`` are mean-subtracted **in place**
+        (frame-wise spatial mean).  The operation is idempotent, so repeated
+        calls on the same objects give the same residuals.
 
     Returns:
-        If store_intermediates is False, returns a Tensor of shape
-        (n_k_values, nk, ny, nx) containing residuals.
-        If store_intermediates is True, returns a ResidualsWithIntermediates
-        with attributes (residuals, Z_KL, proj, ihat, residual_flat).
+        * Default (both flags False): Tensor of shape ``(n_k_values, nk, ny, nx)``.
+        * ``store_intermediates=True``: :class:`ResidualsWithIntermediates` with
+          attributes ``(residuals, Z_KL, proj, ihat, residual_flat)``.
+        * ``return_diagnostics=True``: ``(residuals, KLIPDiagnostics)`` where
+          *residuals* has shape ``(n_k_values, nk, ny, nx)``.
 
     Raises:
         ValueError: If K_klip list is empty, contains non-positive integers,
@@ -133,15 +203,41 @@ def compute_residuals(datacube: DataTensor,
     logger.info("Starting compute_residuals")
     nk, ny, nx = datacube.nk, datacube.ny, datacube.nx
 
+    # RDI: the reference must live on the same pixel grid as the science cube.
+    if ref_datacube is not None and \
+            tuple(ref_datacube.shape[1:]) != (ny, nx):
+        raise ValueError(
+            f"ref_datacube image size {tuple(ref_datacube.shape[1:])} != "
+            f"science image size {(ny, nx)}")
+
+    # RDI: K is bounded by the reference library size, not the target cube.
+    nk_basis = ref_datacube.nk if ref_datacube is not None else nk
+
     # Normalize and validate K_klip
-    K_list = _normalize_and_validate_K(K_klip, nk, logger)
+    K_list = _normalize_and_validate_K(K_klip, nk_basis, logger)
     K_max = K_list[-1]
 
-    # Prepare data: mean‐subtract and replace NaNs
+    # Capture temporal mean of TARGET before in-place mean subtraction
+    if return_diagnostics:
+        mean_frame = torch.nanmean(datacube.tensor, dim=0)  # (ny, nx)
+
+    # Prepare science data: mean‐subtract and replace NaNs
     logger.debug("Mean-subtracting datacube and replacing NaNs")
     processed = datacube.mean_subtract_()
     data = torch.nan_to_num(processed.tensor, nan=0.0)
-    ref_flat = data.view(nk, -1)  # shape: (nk, ny*nx)
+    target_flat = data.view(nk, -1)  # shape: (nk, ny*nx)
+
+    # Build the matrix used to compute the KL basis
+    if ref_datacube is not None:
+        logger.debug("RDI mode: building KL basis from reference library")
+        ref_processed = ref_datacube.mean_subtract_()
+        ref_data = torch.nan_to_num(ref_processed.tensor, nan=0.0)
+        basis_input = ref_data.view(ref_datacube.nk, -1)  # (nk_ref, ny*nx)
+        if normalize_ref:
+            logger.debug("RDI: L2-normalising reference frames")
+            basis_input = _normalize_library(basis_input)
+    else:
+        basis_input = target_flat  # ADI: self-reference
 
     # Compute KL basis
     logger.info(f"Computing KL basis with method={method!r}, K_max={K_max}")
@@ -152,11 +248,17 @@ def compute_residuals(datacube: DataTensor,
         logger.error(error_msg)
         raise ValueError(error_msg)
 
-    Z_KL = basis_fn(ref_flat, K_max)  # shape: (ny*nx, K_max)
+    Z_KL = basis_fn(basis_input, K_max)  # shape: (ny*nx, K_max)
     logger.debug(f"Basis shape: {tuple(Z_KL.shape)}")
+
+    # Alias so the projection loop below works identically for ADI and RDI
+    ref_flat = target_flat
 
     # Always compute a 4D tensor for residuals (n_k_values, nk, ny, nx)
     residuals = torch.zeros(len(K_list), nk, ny, nx, device=data.device)
+    if return_diagnostics:
+        psf_estimates = torch.zeros(len(K_list), nk, ny, nx, device=data.device)
+    coefficients_max: Optional[torch.Tensor] = None
 
     # Compute residuals for each K value
     for i, k in enumerate(K_list):
@@ -168,11 +270,17 @@ def compute_residuals(datacube: DataTensor,
         residual_flat_k = ref_flat - ihat_k  # shape: (nk, ny*nx)
         residuals[i] = residual_flat_k.view(nk, ny, nx)
 
+        if return_diagnostics:
+            psf_estimates[i] = ihat_k.view(nk, ny, nx)
+
         # Store intermediates for max K if requested
         if store_intermediates and k == K_max:
             proj_max = proj_k
             ihat_max = ihat_k
             residual_flat_max = residual_flat_k
+
+        # Track full-K_max coefficients (last iteration = K_max since K_list is sorted)
+        coefficients_max = proj_k
 
     # Restore NaNs from original
     # shape: (1, nk, ny, nx) broadcast to (n_k_values, nk, ny, nx)
@@ -181,13 +289,387 @@ def compute_residuals(datacube: DataTensor,
     residuals = residuals.masked_fill(nan_mask, float("nan"))
 
     logger.info("Finished compute_residuals")
-    # Return intermediates results if requested
+
+    # return_diagnostics takes precedence
+    if return_diagnostics:
+        psf_estimates = psf_estimates.masked_fill(nan_mask, float("nan"))
+        diag = KLIPDiagnostics(
+            kl_basis=Z_KL.T.view(K_max, ny, nx),   # (K_max, ny, nx)
+            mean_frame=mean_frame,                   # (ny, nx)
+            psf_estimates=psf_estimates,             # (n_K, nk, ny, nx)
+            residual_frames=residuals,               # (n_K, nk, ny, nx)
+            coefficients=coefficients_max,           # (nk, K_max)
+            K_list=K_list,
+        )
+        return residuals, diag
+
     if store_intermediates:
         return ResidualsWithIntermediates(
             residuals, Z_KL, proj_max, ihat_max, residual_flat_max
         )
     return residuals
 
+
+# ---------------------------------------------------------------------------
+# Hybrid (ADI + RDI) helpers
+# ---------------------------------------------------------------------------
+
+def _normalize_library(frames: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
+    """Normalize each frame (row) of a library matrix to unit L2-norm.
+
+    This ensures that every frame contributes equal power to the SVD
+    covariance matrix, preventing a large reference library from
+    numerically dominating a small target subset.
+
+    Frames that are entirely zero or masked (all NaN→0) have a near-zero
+    norm; their norm is clamped to *eps* so no division-by-zero occurs,
+    and they effectively stay zero-valued after normalization.
+
+    Args:
+        frames: ``(n_frames, n_pixels)`` float tensor (NaNs already replaced
+            with 0 by the caller).
+        eps: Minimum norm value; prevents division by zero for blank frames.
+
+    Returns:
+        Normalized ``(n_frames, n_pixels)`` tensor where each row has
+        L2-norm ≤ 1 (exactly 1 for non-blank frames).
+    """
+    norms = torch.norm(frames, dim=1, keepdim=True)  # (n_frames, 1)
+    norms = torch.clamp(norms, min=eps)
+    return frames / norms
+
+def _pa_distance(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Smallest absolute angular difference in degrees, handling 0/360 wrap."""
+    return torch.abs(torch.remainder(a - b + 180.0, 360.0) - 180.0)
+
+def _group_frames_by_pa(
+    angles: torch.Tensor,
+    pa_reuse_threshold: float = 0.5,
+) -> List[List[int]]:
+    """Group consecutive frames by PA proximity for KL-basis reuse.
+
+    Frames are clustered so that the absolute PA drift from the batch's
+    representative (first) frame stays below *pa_reuse_threshold*.  A new
+    batch is opened whenever the drift meets or exceeds the threshold.
+
+    In a typical ADI observation the parallactic angle varies smoothly, so
+    consecutive frames naturally form compact groups.  Within one group the
+    set of angularly-excluded frames changes by less than *pa_reuse_threshold*
+    degrees, making a single shared KL basis a good approximation for every
+    member.
+
+    Args:
+        angles: 1-D tensor of parallactic angles in degrees, length ``nk``.
+        pa_reuse_threshold: Maximum PA change (degrees) from the batch
+            representative before starting a new batch.  Default ``0.5`` deg.
+
+    Returns:
+        List of groups; each group is a sorted list of frame indices.
+        Groups are non-overlapping and together cover all ``nk`` frames.
+    """
+    nk = len(angles)
+    if nk == 0:
+        return []
+    groups: List[List[int]] = []
+    current_group: List[int] = [0]
+    ref_pa: float = angles[0].item()
+    for i in range(1, nk):
+        if abs(angles[i].item() - ref_pa) < pa_reuse_threshold:
+            current_group.append(i)
+        else:
+            groups.append(current_group)
+            current_group = [i]
+            ref_pa = angles[i].item()
+    groups.append(current_group)
+    return groups
+
+
+def compute_residuals_hybrid(
+    datacube: DataTensor,
+    K_klip: Union[int, List[int]],
+    angles: torch.Tensor,
+    method: str = "svd",
+    annular_exclusion: float = 0.0,
+    pa_reuse_threshold: float = 0.5,
+    return_diagnostics: bool = False,
+    ref_datacube: Optional[DataTensor] = None,
+    hybrid_weight: float = 1.0,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, KLIPDiagnostics]]:
+    """Compute PSF-subtracted residuals in ADI+RDI hybrid (``'hybrid'``) mode.
+
+    For each PA batch :math:`B` the reference library is assembled as
+
+    .. math::
+
+        \\mathcal{L}_B = \\mathcal{R}_{\\text{ref}}
+                         \\cup
+                         \\bigl\\{ I_j : j \\notin B,\\;
+                                   \\min_{i \\in B} |\\text{PA}_j - \\text{PA}_i|
+                                   > \\delta_{\\text{excl}} \\bigr\\}
+
+    where a target frame :math:`I_j` is eligible only if it is not in the batch
+    and its PA differs by more than :math:`\\delta_{\\text{excl}}`
+    (*annular_exclusion*) from every frame in the batch, and
+    :math:`\\mathcal{R}_{\\text{ref}}` is the external reference library
+    (empty when *ref_datacube* is ``None``).
+
+    A single KL basis is shared by all frames whose PA lies within
+    *pa_reuse_threshold* degrees of the batch representative, avoiding a full
+    SVD recomputation for every individual frame.
+
+    Args:
+        datacube: Science (target) DataTensor of shape ``(nk, ny, nx)``.
+        K_klip: Integer or list of integers specifying KL mode counts.
+        angles: 1-D tensor of parallactic angles in degrees, length ``nk``.
+            Must reside on the same device as ``datacube``.
+        method: Basis computation strategy — ``'svd'``, ``'pca'``, or
+            ``'eigh'``.  Defaults to ``'svd'``.
+        annular_exclusion: Angular exclusion in degrees.  A target frame enters
+            a batch's KL library only if its PA differs by more than this value
+            from every frame in the batch; the batch's own frames are always
+            excluded.  At separation ``r`` (pixels) a PA change ``Δθ`` moves the
+            planet by about ``r * radians(Δθ)`` pixels, so requiring a motion of
+            ``N`` FWHM at the innermost separation of interest corresponds to
+            ``annular_exclusion = degrees(N * FWHM / r)`` (e.g. ``N=1``,
+            ``FWHM=3`` px, ``r=20`` px gives about 8.6 deg).  ``0.0`` (default)
+            excludes only the batch itself and gives little protection against
+            planet self-subtraction; a warning is logged in that case.
+        pa_reuse_threshold: PA change (degrees) that triggers a new SVD
+            computation.  All frames within the same batch share a single KL
+            basis.  Default ``0.5`` deg.
+        return_diagnostics: If ``True``, return a
+            ``(residuals, KLIPDiagnostics)`` tuple.  ``kl_basis`` and
+            ``coefficients`` are taken from the **last** PA batch;
+            ``mean_frame`` is computed before any mean subtraction.
+        ref_datacube: Optional external reference-star DataTensor.  Its frames
+            are always included in the library regardless of their PA.  When
+            ``None`` the mode degrades to ADI-only with angular exclusion.
+        hybrid_weight: Multiplicative scale applied to the **normalized**
+            target frames before concatenating them with the reference
+            library for SVD.  Default ``1.0`` (equal amplitude).  Setting
+            this above ``1.0`` upweights the self-reference (ADI) component
+            so that a large reference library does not dominate the KL
+            basis.  For example, ``hybrid_weight=3.0`` gives the target
+            frames roughly 3× the per-frame amplitude of reference frames
+            in the SVD covariance matrix.
+
+            Both the reference and target libraries are per-frame L2
+            normalized before this weight is applied, so the effect is
+            independent of the raw flux scale of each dataset.
+
+    Returns:
+        * Default: Tensor ``(n_K, nk, ny, nx)`` of PSF-subtracted residuals.
+        * ``return_diagnostics=True``: ``(residuals, KLIPDiagnostics)`` where
+          *residuals* has the shape above.
+
+    Raises:
+        ValueError: If K_klip is invalid, or *method* is unrecognised, or
+            ``K_max`` exceeds the maximum possible library size.
+    """
+    logger.info("Starting compute_residuals_hybrid")
+    nk, ny, nx = datacube.nk, datacube.ny, datacube.nx
+    n_ref = ref_datacube.nk if ref_datacube is not None else 0
+    # Maximum possible library = all reference frames + all target frames
+    max_lib_size = n_ref + nk
+
+    K_list = _normalize_and_validate_K(K_klip, max_lib_size, logger)
+    K_max = K_list[-1]
+
+    if annular_exclusion <= 0:
+        logger.warning(
+            "Hybrid: annular_exclusion=0 excludes only the current PA batch from "
+            "its own KL library; target frames at nearby PA may cause planet "
+            "self-subtraction.  See the annular_exclusion docstring for guidance."
+        )
+
+    # Capture temporal mean before in-place mean subtraction
+    if return_diagnostics:
+        mean_frame = torch.nanmean(datacube.tensor, dim=0)  # (ny, nx)
+
+    # Prepare science frames: mean-subtract in-place, then replace NaNs with 0
+    logger.debug("Hybrid: mean-subtracting science datacube")
+    processed = datacube.mean_subtract_()
+    data = torch.nan_to_num(processed.tensor, nan=0.0)
+    target_flat = data.view(nk, -1)  # (nk, ny*nx)
+
+    # Prepare reference frames when provided
+    ref_flat: Optional[torch.Tensor] = None
+    ref_flat_norm: Optional[torch.Tensor] = None
+    if ref_datacube is not None:
+        logger.debug("Hybrid: mean-subtracting reference library")
+        ref_processed = ref_datacube.mean_subtract_()
+        ref_data = torch.nan_to_num(ref_processed.tensor, nan=0.0)
+        ref_flat = ref_data.view(n_ref, -1)  # (n_ref, ny*nx)
+        ref_flat_norm = _normalize_library(ref_flat)
+
+    # Pre-compute normalized target frames (for basis construction only).
+    # The projection step always uses the original target_flat.
+    target_flat_norm = _normalize_library(target_flat)
+
+    if ref_flat is not None:
+        logger.debug(
+            f"Hybrid: n_ref={n_ref}, n_target={nk}, "
+            f"hybrid_weight={hybrid_weight:.3g}  "
+            "(per-frame L2 normalization applied to both libraries before SVD)"
+        )
+
+    # Select basis strategy
+    try:
+        basis_fn = _basis_strategies[method]
+    except KeyError:
+        error_msg = (
+            f"Unknown method: {method!r}; "
+            f"must be one of {list(_basis_strategies)}"
+        )
+        logger.error(error_msg)
+        raise ValueError(error_msg)
+
+    # Allocate output tensors on the same device as the science data
+    residuals = torch.zeros(len(K_list), nk, ny, nx, device=data.device)
+    if return_diagnostics:
+        psf_estimates = torch.zeros(len(K_list), nk, ny, nx, device=data.device)
+    # Accumulates per-frame projection coefficients (zero-padded to K_max)
+    coefficients_out = torch.zeros(nk, K_max, device=data.device)
+
+    # Group consecutive frames by PA for basis reuse
+    pa_groups = _group_frames_by_pa(angles, pa_reuse_threshold)
+    logger.info(
+        f"Hybrid: {len(pa_groups)} PA-groups over {nk} frames "
+        f"(pa_reuse_threshold={pa_reuse_threshold} deg, "
+        f"annular_exclusion={annular_exclusion} deg)"
+    )
+
+    # Preserved from the last batch for KLIPDiagnostics
+    Z_KL_last: Optional[torch.Tensor] = None
+    # Track PA groups whose library is smaller than K_max
+    n_clamped = 0
+    min_lib_size = K_max
+
+    for grp_idx, group in enumerate(pa_groups):
+        # Representative PA: use the first frame of the batch
+        rep_pa: float = angles[group[0]].item()
+        g = len(group)
+
+        # A target frame may enter this batch's library only if it is farther
+        # than annular_exclusion from EVERY frame in the batch, and the batch's
+        # own frames are always excluded, so no frame is fitted with itself.
+        group_idx = torch.tensor(group, device=angles.device)
+        dist = _pa_distance(angles.unsqueeze(1), angles[group_idx].unsqueeze(0))  # (nk, g)
+        valid_mask: torch.Tensor = dist.min(dim=1).values > annular_exclusion     # (nk,)
+        valid_mask[group_idx] = False
+        n_valid: int = int(valid_mask.sum().item())
+
+        # Assemble the combined library for SVD using normalized frames.
+        # Normalization ensures each frame contributes equal power to the KL
+        # basis regardless of raw flux differences between the two datasets.
+        # hybrid_weight upscales the target subset so it is not washed out
+        # when n_ref >> n_valid.
+        lib_parts_norm: List[torch.Tensor] = []
+        if ref_flat_norm is not None:
+            lib_parts_norm.append(ref_flat_norm)           # unit-norm ref rows
+        if n_valid > 0:
+            # Scale target frames by hybrid_weight for basis construction
+            lib_parts_norm.append(
+                target_flat_norm[valid_mask] * hybrid_weight
+            )
+
+        if not lib_parts_norm:
+            error_msg = (
+                f"Hybrid group {grp_idx}: empty KL library for "
+                f"PA_rep={rep_pa:.2f} deg with annular_exclusion="
+                f"{annular_exclusion} deg and no reference library. "
+                "Reduce annular_exclusion or provide ref_data."
+            )
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+        lib = torch.cat(lib_parts_norm, dim=0)             # (n_lib, ny*nx)
+
+        logger.debug(
+            f"Hybrid group {grp_idx}: basis lib n_rows={lib.shape[0]} "
+            f"(ref={n_ref if ref_flat_norm is not None else 0}, "
+            f"target_valid={n_valid}, hybrid_weight={hybrid_weight:.3g})"
+        )
+
+        # SVD rank cannot exceed the number of library frames
+        k_max_eff = min(K_max, lib.shape[0])
+        if k_max_eff < K_max:
+            n_clamped += 1
+            min_lib_size = min(min_lib_size, lib.shape[0])
+            logger.debug(
+                f"Hybrid group {grp_idx}: clamping K_max {K_max} → {k_max_eff} "
+                f"(library size={lib.shape[0]}, PA_rep={rep_pa:.2f} deg)"
+            )
+
+        # Compute the KL basis for this PA batch
+        logger.debug(
+            f"Hybrid group {grp_idx}/{len(pa_groups)}: "
+            f"frames={group}, n_lib={lib.shape[0]}, K_max_eff={k_max_eff}"
+        )
+        Z_KL = basis_fn(lib, k_max_eff)  # (ny*nx, k_max_eff)
+        Z_KL_last = Z_KL
+
+        # Vectorised projection over all frames in this batch
+        group_frames = target_flat[group]  # (g, ny*nx)
+
+        for list_idx, k in enumerate(K_list):
+            k_eff = min(k, k_max_eff)
+            V = Z_KL[:, :k_eff]                           # (ny*nx, k_eff)
+            proj = group_frames @ V                        # (g, k_eff)
+            ihat = proj @ V.T                              # (g, ny*nx)
+            res = group_frames - ihat                      # (g, ny*nx)
+
+            residuals[list_idx, group] = res.view(g, ny, nx)
+            if return_diagnostics:
+                psf_estimates[list_idx, group] = ihat.view(g, ny, nx)
+
+            # Store projection coefficients for the largest K value
+            # (zero-padded to K_max when k_max_eff < K_max)
+            if k == K_list[-1]:
+                coefficients_out[group, :k_eff] = proj
+
+    if n_clamped:
+        logger.warning(
+            f"Hybrid: K_max={K_max} exceeds the KL library size in "
+            f"{n_clamped}/{len(pa_groups)} PA groups (smallest library: "
+            f"{min_lib_size} frames); those groups use fewer KL modes than requested."
+        )
+
+    # Restore NaN positions (NaNs survive mean_subtract_() in-place)
+    logger.debug("Hybrid: restoring NaN mask")
+    nan_mask = torch.isnan(datacube.tensor).unsqueeze(0)  # (1, nk, ny, nx)
+    residuals = residuals.masked_fill(nan_mask, float("nan"))
+
+    logger.info("Finished compute_residuals_hybrid")
+
+    if return_diagnostics:
+        psf_estimates = psf_estimates.masked_fill(nan_mask, float("nan"))
+
+        # Build kl_basis from the last PA batch; zero-pad if clamped below K_max
+        if Z_KL_last is not None:
+            k_diag = Z_KL_last.shape[1]
+            kl_basis = Z_KL_last.T.view(k_diag, ny, nx)
+            if k_diag < K_max:
+                pad = torch.zeros(K_max - k_diag, ny, nx, device=data.device)
+                kl_basis = torch.cat([kl_basis, pad], dim=0)
+        else:
+            kl_basis = torch.zeros(K_max, ny, nx, device=data.device)
+
+        diag = KLIPDiagnostics(
+            kl_basis=kl_basis,               # (K_max, ny, nx)
+            mean_frame=mean_frame,            # (ny, nx)
+            psf_estimates=psf_estimates,      # (n_K, nk, ny, nx)
+            residual_frames=residuals,        # (n_K, nk, ny, nx)
+            coefficients=coefficients_out,    # (nk, K_max)
+            K_list=K_list,
+        )
+        return residuals, diag
+
+    return residuals
+
+
+# ---------------------------------------------------------------------------
+# Rotation / combination utilities
+# ---------------------------------------------------------------------------
 
 def batch_rotate(images: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
     """Rotates a stack of images by given angles via a single batched affine transform.
@@ -311,6 +793,78 @@ def combine_cube(derotated: torch.Tensor,
         raise ValueError("statistic must be 'mean' or 'median'")
 
 
+# ---------------------------------------------------------------------------
+# RDI helpers: mask sharing and reference-frame selection
+# ---------------------------------------------------------------------------
+
+def _share_nan_mask(sci: DataTensor, ref: DataTensor) -> None:
+    """Mask in ``ref`` every pixel that is NaN in any science frame.
+
+    Operates **in place on** ``ref`` only; ``sci`` is never modified, so ADI
+    results are unaffected.  After this call the reference library is zero
+    (after ``nan_to_num``) exactly where the science frames are zero, which
+    keeps the KL basis and the science projection on the same pixel set.
+
+    Args:
+        sci: Science DataTensor (already circularly masked, if applicable).
+        ref: Reference DataTensor with the same ``(ny, nx)``.
+
+    Raises:
+        ValueError: If the image sizes differ.
+    """
+    if tuple(sci.shape[1:]) != tuple(ref.shape[1:]):
+        raise ValueError(
+            f"ref image size {tuple(ref.shape[1:])} != "
+            f"science image size {tuple(sci.shape[1:])}")
+    sci_nan = torch.isnan(sci.tensor).any(dim=0)          # (ny, nx)
+    ref.tensor[:, sci_nan] = float("nan")
+
+
+def select_reference_frames(sci: DataTensor,
+                            ref: DataTensor,
+                            n_keep: int) -> DataTensor:
+    """Keep the ``n_keep`` reference frames most correlated with the science.
+
+    Correlation (Pearson) is computed between each reference frame and the
+    median science frame over the pixels that are valid in the science cube.
+
+    Args:
+        sci: Science DataTensor.
+        ref: Reference DataTensor (same ``(ny, nx)``).
+        n_keep: Number of reference frames to keep (clipped to ``ref.nk``).
+
+    Returns:
+        A new DataTensor holding the selected reference frames, ordered from
+        most to least correlated.
+
+    Raises:
+        ValueError: If ``n_keep < 1`` or the image sizes differ.
+    """
+    if n_keep < 1:
+        raise ValueError("n_keep must be >= 1")
+    if tuple(sci.shape[1:]) != tuple(ref.shape[1:]):
+        raise ValueError(
+            f"ref image size {tuple(ref.shape[1:])} != "
+            f"science image size {tuple(sci.shape[1:])}")
+
+    n_keep = min(n_keep, ref.nk)
+    sci_med = torch.nanmedian(sci.tensor, dim=0).values.flatten()   # (P,)
+    valid = ~torch.isnan(sci.tensor).any(dim=0).flatten() & ~torch.isnan(sci_med)
+
+    s = sci_med[valid]
+    r = torch.nan_to_num(ref.tensor.flatten(1)[:, valid], nan=0.0)  # (N, P_valid)
+    s = s - s.mean()
+    r = r - r.mean(dim=1, keepdim=True)
+    corr = (r @ s) / (r.norm(dim=1) * s.norm() + 1e-12)
+
+    idx = torch.argsort(corr, descending=True)[:n_keep]
+    logger.info(
+        f"Selected {n_keep}/{ref.nk} reference frames "
+        f"(corr range {corr[idx].min().item():.3f} .. {corr[idx].max().item():.3f})")
+    return DataTensor(ref.tensor[idx], center=ref.center,
+                      IWA=ref.IWA, OWA=ref.OWA)
+
+
 class TorchKLIP:
     """
     High-level wrapper to run PSF subtraction and derotation.
@@ -329,21 +883,28 @@ class TorchKLIP:
     def __init__(self,
                  datacube: DataTensor,
                  angles: Union[List[float], torch.Tensor],
-                 #   IWA: Optional[float] = None,
-                 #   OWA: Optional[float] = None,
+                 IWA: Optional[float] = None,
+                 OWA: Optional[float] = None,
                  device: str = "cpu",
                  collect_metrics: bool = True,
-                 store_intermediates: bool = False) -> None:
+                 store_intermediates: bool = False,
+                 ref_data: Optional[DataTensor] = None) -> None:
         """Initializes the TorchKLIP processor.
 
         Args:
-            datacube: DataTensor containing the input frames.
+            datacube: DataTensor containing the science (target) frames.
             angles: List or tensor of derotation angles in degrees.
             IWA: Inner Working Angle for annular mask in pixels (optional).
+                Takes precedence over ``datacube.IWA`` when provided.
             OWA: Outer Working Angle for annular mask in pixels (optional).
+                Takes precedence over ``datacube.OWA`` when provided.
             device: Device to run computation on ('cpu' or 'cuda').
             collect_metrics: If True, record timing metrics.
             store_intermediates: If True, keep intermediate arrays.
+            ref_data: Optional reference-star DataTensor for RDI or hybrid
+                mode.  When supplied, ``klip_and_derotate`` with
+                ``mode='rdi'`` or ``mode='hybrid'`` can use this library to
+                augment the KL basis.
 
         Raises:
             ValueError: If number of angles doesn't match number of frames.
@@ -351,6 +912,9 @@ class TorchKLIP:
 
         self.device = torch.device(device)
         self.datacube = datacube.to(device)
+        self.ref_datacube: Optional[DataTensor] = (
+            ref_data.to(device) if ref_data is not None else None
+        )
         if isinstance(angles, torch.Tensor):
             self.angles = angles.clone().detach().to(
                 dtype=torch.float32, device=self.device)
@@ -364,8 +928,10 @@ class TorchKLIP:
         self.perfmon = PerformanceMonitor(self.device, enabled=collect_metrics)
         self.store_intermediates = store_intermediates
         self.metrics = {}
-        self.IWA = datacube.IWA
-        self.OWA = datacube.OWA
+
+        # Prefer constructor arguments; fall back to datacube metadata
+        self.IWA = IWA if IWA is not None else datacube.IWA
+        self.OWA = OWA if OWA is not None else datacube.OWA
 
         if len(angles) != self.datacube.nk:
             logger.error(
@@ -376,6 +942,15 @@ class TorchKLIP:
             logger.info(
                 f"Applying circular mask with IWA={self.IWA}, OWA={self.OWA}")
             self.datacube.mask_circular_(self.IWA, self.OWA)
+
+        # RDI / hybrid: put the reference library on the same pixel set as the
+        # (now masked) science cube.  Without this the KL basis is dominated by
+        # pixels (e.g. inside the IWA) that the science frames have zeroed out.
+        if self.ref_datacube is not None:
+            _share_nan_mask(self.datacube, self.ref_datacube)
+            logger.info(
+                f"Reference library: {self.ref_datacube.nk} frames; "
+                "science NaN mask applied")
 
     def _log_metrics(self):
         m = self.metrics
@@ -397,7 +972,14 @@ class TorchKLIP:
                           method: str = "svd",
                           statistic: str = "mean",
                           isbatch: bool = True,
-                          mode: str = "adi") -> torch.Tensor:
+                          mode: str = "adi",
+                          return_diagnostics: bool = False,
+                          annular_exclusion: float = 0.0,
+                          pa_reuse_threshold: float = 0.5,
+                          hybrid_weight: float = 1.0,
+                          normalize_ref: bool = False,
+                          ) -> Union[torch.Tensor,
+                                     Tuple[torch.Tensor, KLIPDiagnostics]]:
         """
         Perform KLIP PSF subtraction, derotation, and combination.
 
@@ -406,46 +988,171 @@ class TorchKLIP:
         derotated frames.
 
         Args:
-            K_klip: Number of KL modes to use (integer or list of integers)
-            method: Method for computing basis ("svd", "pca", or "eigh")
-            statistic: Statistic for combining frames ("mean" or "median")
-            isbatch: Whether to use batch rotation
-            mode: Processing mode ("adi" only supported currently)
+            K_klip: Number of KL modes to use (integer or list of integers).
+            method: Method for computing basis ("svd", "pca", or "eigh").
+            statistic: Statistic for combining frames ("mean" or "median").
+            isbatch: Whether to use batch rotation.
+            mode: Processing mode:
+
+                * ``"adi"`` — full-frame self-reference ADI: one KL basis is
+                  built from all science frames, including the frame being
+                  subtracted, with no angular exclusion.  Planet throughput
+                  therefore falls as K approaches the number of frames.  For
+                  ADI with angular exclusion, use ``"hybrid"`` without
+                  ``ref_data``.
+                * ``"rdi"`` — external reference library supplied via
+                  ``ref_data`` at construction time.
+                * ``"hybrid"`` — ADI + RDI combined. For each PA batch the KL
+                  basis is built from the union of the reference library and
+                  the subset of target frames satisfying the angular exclusion
+                  criterion ``|PA_target - PA_batch_rep| > annular_exclusion``.
+
+            return_diagnostics: If True, return a ``(result, KLIPDiagnostics)``
+                tuple instead of just ``result``.  The :class:`KLIPDiagnostics`
+                object contains the following image-shaped arrays:
+
+                * ``kl_basis`` – KL-mode eigenimages ``(K_max, ny, nx)``
+                * ``mean_frame`` – temporal mean before subtraction ``(ny, nx)``
+                * ``psf_estimates`` – reconstructed PSF per K ``(n_K, nk, ny, nx)``
+                * ``residual_frames`` – pre-collapse residuals per K ``(n_K, nk, ny, nx)``
+                * ``coefficients`` – projection weights ``(nk, K_max)``
+                * ``K_list`` – sorted list of K values used
+
+                The diagnostics are also stored as ``self.diagnostics`` for
+                convenient post-hoc access.
+
+                .. note::
+                    In ``hybrid`` mode ``kl_basis`` and ``coefficients``
+                    reflect the **last** PA batch.  All other diagnostic
+                    arrays cover every frame.
+
+            annular_exclusion: Angular exclusion threshold in degrees used only
+                in ``hybrid`` mode.  Target frames within this PA distance of
+                the batch representative are excluded from the self-reference
+                subset of the library.  Default ``0.0`` (exclude only exact
+                PA matches).
+            pa_reuse_threshold: PA change in degrees that triggers a new SVD
+                computation in ``hybrid`` mode.  Frames within the same PA
+                batch share a single KL basis.  Default ``0.5`` deg.
+            hybrid_weight: Relative amplitude of target frames versus
+                reference frames when building the KL basis in ``hybrid``
+                mode.  Both libraries are per-frame L2-normalized before
+                this scale is applied, so ``1.0`` (default) gives equal
+                per-frame weight.  Increase above ``1.0`` to prevent a
+                large reference library from dominating the SVD.
+                Has no effect in ``adi`` or ``rdi`` mode.
+            normalize_ref: ``rdi`` mode only.  L2-normalise each reference
+                frame before building the KL basis.  Default ``False``.
+                (``hybrid`` mode always normalises.)
 
         Returns:
-            For single K_klip (integer): A 2D tensor of shape (ny, nx)
-            For multiple K_klip (list): A 3D tensor of shape (len(K_klip), ny, nx)
+            * Default: 2D tensor ``(ny, nx)`` for single K, or 3D tensor
+              ``(len(K_klip), ny, nx)`` for multiple K values.
+            * ``return_diagnostics=True``: ``(result, KLIPDiagnostics)`` where
+              *result* has the same shape as above.
+
+        Raises:
+            NotImplementedError: If *mode* is not ``'adi'``, ``'rdi'``, or
+                ``'hybrid'``.
+            ValueError: If ``mode='rdi'`` and no ``ref_data`` was provided at
+                construction time.
         """
         # Validate processing mode
-        if mode.lower() != "adi":
+        mode = mode.lower()
+        if mode not in ("adi", "rdi", "hybrid"):
             raise NotImplementedError(
-                f"Mode '{mode}' not supported; only 'adi' is implemented.")
+                f"Mode '{mode}' not supported; choose 'adi', 'rdi', or 'hybrid'.")
+        if mode == "rdi" and self.ref_datacube is None:
+            raise ValueError(
+                "mode='rdi' requires ref_data to be provided at construction time.")
 
         # Track if input is a single K value for final output shape
         is_single_k = isinstance(K_klip, int)
         k_list = [K_klip] if is_single_k else K_klip
 
         logger.info(
-            f"Running KLIP with K={k_list}, method={method}, statistic={statistic}")
+            f"Running KLIP with K={k_list}, method={method}, "
+            f"statistic={statistic}, mode={mode}"
+        )
 
-        # 1. PSF subtraction
+        # For rdi/hybrid: if the reference has NaN pixels that are valid in the
+        # science cube, mask those pixels in a working copy of the science so
+        # both sides use exactly the same pixel set.  (ADI is untouched.)
+        sci_dc = self.datacube
+        if mode in ("rdi", "hybrid") and self.ref_datacube is not None:
+            extra = (torch.isnan(self.ref_datacube.tensor).any(dim=0)
+                     & ~torch.isnan(self.datacube.tensor).any(dim=0))
+            if extra.any():
+                logger.warning(
+                    f"{int(extra.sum())} pixels are NaN in the reference but "
+                    "valid in the science cube; masking them in the science "
+                    "working copy.")
+                sci_dc = DataTensor(self.datacube.tensor.clone(),
+                                    center=self.datacube.center,
+                                    IWA=self.datacube.IWA,
+                                    OWA=self.datacube.OWA,
+                                    copy=False)
+                sci_dc.tensor[:, extra] = float("nan")
+
+        # 1. PSF subtraction ------------------------------------------------
         self.perfmon.start_timer("total")
         self.perfmon.start_timer("psfsub")
-        if self.store_intermediates:
-            out = compute_residuals(
-                self.datacube, k_list, method, store_intermediates=True
-            )
-            if isinstance(out, ResidualsWithIntermediates):
-                residuals = out.residuals
-                self.Z_KL = out.Z_KL
-                self.proj = out.proj
-                self.ihat = out.ihat
-                self.residual_flat = out.residual_flat
+
+        if mode == "hybrid":
+            if self.store_intermediates:
+                logger.warning(
+                    "store_intermediates=True is not supported in hybrid mode; "
+                    "intermediate arrays will not be stored."
+                )
+            if return_diagnostics:
+                residuals, diagnostics = compute_residuals_hybrid(
+                    sci_dc, k_list, self.angles, method,
+                    annular_exclusion=annular_exclusion,
+                    pa_reuse_threshold=pa_reuse_threshold,
+                    return_diagnostics=True,
+                    ref_datacube=self.ref_datacube,
+                    hybrid_weight=hybrid_weight,
+                )
+                self.diagnostics = diagnostics
             else:
-                residuals, self.Z_KL, self.proj, self.ihat, self.residual_flat = out
-            self.residuals = residuals
+                residuals = compute_residuals_hybrid(
+                    sci_dc, k_list, self.angles, method,
+                    annular_exclusion=annular_exclusion,
+                    pa_reuse_threshold=pa_reuse_threshold,
+                    ref_datacube=self.ref_datacube,
+                    hybrid_weight=hybrid_weight,
+                )
         else:
-            residuals = compute_residuals(self.datacube, k_list, method)
+            # ADI or RDI path (unchanged)
+            ref_dc = self.ref_datacube if mode == "rdi" else None
+            if return_diagnostics:
+                residuals, diagnostics = compute_residuals(
+                    sci_dc, k_list, method,
+                    return_diagnostics=True, ref_datacube=ref_dc,
+                    normalize_ref=normalize_ref,
+                )
+                self.diagnostics = diagnostics
+            elif self.store_intermediates:
+                out = compute_residuals(
+                    sci_dc, k_list, method,
+                    store_intermediates=True, ref_datacube=ref_dc,
+                    normalize_ref=normalize_ref,
+                )
+                if isinstance(out, ResidualsWithIntermediates):
+                    residuals = out.residuals
+                    self.Z_KL = out.Z_KL
+                    self.proj = out.proj
+                    self.ihat = out.ihat
+                    self.residual_flat = out.residual_flat
+                else:
+                    residuals, self.Z_KL, self.proj, self.ihat, self.residual_flat = out
+                self.residuals = residuals
+            else:
+                residuals = compute_residuals(
+                    sci_dc, k_list, method, ref_datacube=ref_dc,
+                    normalize_ref=normalize_ref,
+                )
+
         self.perfmon.stop_timer("psfsub")
 
         # 2. Derotation
@@ -462,8 +1169,6 @@ class TorchKLIP:
         if self.collect_metrics:
             self.perfmon.collect_memory_metrics()
             self.metrics = self.perfmon.get_metrics()
-            # self.perfmon.print_metrics()
-            # self._log_metrics()
 
         #  Reapply final circular mask if IWA/OWA are set
         if self.IWA is not None or self.OWA is not None:
@@ -476,8 +1181,12 @@ class TorchKLIP:
 
         # Only squeeze for single K value at the end
         if is_single_k:
-            return result.squeeze(0)
+            result = result.squeeze(0)
+
+        if return_diagnostics:
+            return result, self.diagnostics
         return result
 
 
-__all__ = ["TorchKLIP"]
+__all__ = ["TorchKLIP", "KLIPDiagnostics", "compute_residuals_hybrid",
+           "select_reference_frames"]
