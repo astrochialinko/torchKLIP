@@ -31,6 +31,9 @@ extensions = ['sphinx.ext.autodoc',
               'sphinx.ext.autosummary',
               'sphinx.ext.intersphinx']
 
+# Napoleon (Google-style docstrings)
+napoleon_use_ivar = True
+
 # Automatically generate stub pages for any autosummary directives
 autosummary_generate = True
 
