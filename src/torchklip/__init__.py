@@ -7,6 +7,7 @@ from . import io
 from . import plotting
 from .io import *
 from .plotting import *
+from importlib.metadata import version as _version
 
 # Initialize package-level logger
 logger = setup_logger()
@@ -19,3 +20,5 @@ __all__ = (
     + io.__all__
     + plotting.__all__
 )
+
+__version__ = _version("torchklip")

@@ -8,13 +8,18 @@
 
 import os
 import sys
+from importlib.metadata import PackageNotFoundError, version as _version
 sys.path.insert(0, os.path.abspath('../../src/'))
 
 project = 'torchklip'
 copyright = '2025, Chia-Lin Ko'
 author = 'Chia-Lin Ko'
 root_doc = 'index'
-release = 'v0.1'
+try:
+    release = _version("torchklip")
+except PackageNotFoundError:
+    release = "unknown"
+version = ".".join(release.split(".")[:2])
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
