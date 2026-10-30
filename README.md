@@ -1,13 +1,25 @@
 # torchKLIP
 
 [![arXiv](https://img.shields.io/badge/arXiv-2409.16466-b31b1b.svg?logo=arXiv)](https://arxiv.org/abs/2409.16466)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.2-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-%3E%3D1.13-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?logo=open-source-initiative&logoColor=white)](https://opensource.org/licenses/MIT)
-[![Documentation Status](https://img.shields.io/badge/docs-latest%20build-brightgreen?logo=read-the-docs&logoColor=white)](https://torchklip.readthedocs.io/en/latest/?badge=latest)
-[![Python 3.11](https://img.shields.io/badge/python-3.11-blue?logo=python&logoColor=white)](https://pypi.org/project/torchklip/)
+[![Documentation Status](https://img.shields.io/readthedocs/torchklip?logo=read-the-docs&logoColor=white)](https://torchklip.readthedocs.io/en/latest/?badge=latest)
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue?logo=python&logoColor=white)](https://pypi.org/project/torchklip/)
 [![PyPI Status](https://img.shields.io/pypi/v/torchklip.svg?logo=pypi&logoColor=white&color=purple)](https://pypi.org/project/torchklip/)
+[![Tests](https://img.shields.io/github/actions/workflow/status/astrochialinko/torchKLIP/tests.yml?branch=main&logo=github&logoColor=white&label=tests)](https://github.com/astrochialinko/torchKLIP/actions/workflows/tests.yml)
 
 torchKLIP is a PyTorch implementation of the PCA-based Karhunen–Loève Image Projection (KLIP) algorithm for point spread function (PSF) subtraction in the direct imaging of exoplanets.
+
+## Features
+
+- **ADI**: full-frame angular differential imaging using the science frames themselves
+- **RDI**: reference differential imaging with a separate reference-star library
+- **Hybrid ADI+RDI**: combines reference frames with science frames taken at
+  sufficiently different rotation angles
+- Three KL basis solvers (`svd`, `pca`, `eigh`), with CPU and GPU support via PyTorch
+- Diagnostics: KL eigenimages, PSF models, residuals and projection coefficients
+- Multi-planet SNR measurement with keep-out zones around other planets
+- FITS output helpers and plotting utilities
 
 ## Set-Up
 
@@ -33,7 +45,7 @@ pip install torchklip
 Install the latest code directly from the repository:
 
 ```bash
-pip install git+ssh://git@github.com/astrochialinko/torchKLIP.git
+pip install git+https://github.com/astrochialinko/torchKLIP.git
 ```
 
 ### Development Mode
@@ -61,7 +73,7 @@ pip install -e .
 
 ### Jupyter Notebook
 
-If you plan to use Jupyter Notebook, as recommended, , first install the Jupyter kernel package
+If you plan to use Jupyter Notebook, as recommended, first install the Jupyter kernel package
 
 ```bash
 pip install ipykernel
@@ -75,7 +87,7 @@ python3 -m ipykernel install --user --name "torchklip" --display-name "torchklip
 
 ## Documentation
 
-The full documentation, including detailed API references, installation steps, example datasets, and tutorials, is available on [Read the Docs](https://torchklip.readthedocs.io).
+The full documentation, including detailed API references, installation steps, example datasets, and tutorials, is available on [Read the Docs](https://torchklip.readthedocs.io). See the [CHANGELOG](https://github.com/astrochialinko/torchKLIP/blob/main/CHANGELOG.md) for release notes.
 
 ## Quick Start
 
@@ -85,7 +97,7 @@ To quickly test torchKLIP, follow these steps:
    ```bash
    pip install notebook  # or: conda install notebook
    ```
-2. Launch the [example notebook](notebooks/tutorial_betaPic.ipynb):
+2. Launch the [example notebook](https://github.com/astrochialinko/torchKLIP/blob/main/notebooks/tutorial_betaPic.ipynb):
    ```bash
    jupyter notebook notebooks/tutorial_betaPic.ipynb
    ```
@@ -93,42 +105,26 @@ To quickly test torchKLIP, follow these steps:
 
 This notebook walks through a KLIP-based PSF subtraction example using the Beta Pictoris dataset and demonstrates key features of the package.
 
-## File Structure
+## Usage
 
+```python
+import torch
+from torchklip import TorchKLIP, DataTensor
+
+sci = DataTensor(sci_cube)        # (N, H, W) science frames
+ref = DataTensor(ref_cube)        # (M, H, W) reference-star frames
+angles = torch.tensor(angles_deg) # (N,) derotation angles in degrees
+
+klip = TorchKLIP(sci, angles, ref_data=ref)
+K = [5, 10, 20]
+
+adi    = klip.klip_and_derotate(K, mode="adi")
+rdi    = klip.klip_and_derotate(K, mode="rdi")
+hybrid = klip.klip_and_derotate(K, mode="hybrid", annular_exclusion=10.0)
 ```
-.
-├── LICENSE                          # License information
-├── README.md                        # This overview file
-├── data/                            # (Optional) Example data or staging area
-├── docs/                            # Documentation sources (Sphinx/ReadTheDocs)
-├── logs/                            # Runtime logs and profiler output
-├── notebooks/                       # Jupyter notebooks for tutorials and experiments
-│   └── tutorial_betaPic.ipynb       # Demo notebook on Beta Pictoris dataset
-├── pyproject.toml                   # Build configuration and metadata
-├── src/torchklip/                   # Core package source code
-│   ├── __init__.py                  # Package entry point
-│   ├── algos/                       # KLIP algorithm implementations
-│   │   ├── __init__.py
-│   │   └── klip/                    # SVD, Eign, and PCA solver for KLIP
-│   │       ├── __init__.py
-│   │       ├── eigh.py              # Eigensolver using SciPy
-│   │       ├── klip_base.py         # Base KLIP class and common logic
-│   │       ├── pca.py               # PCA-based projection implementation
-│   │       └── svd.py               # SVD-based projection variant
-│   ├── config.py                    # Configuration management and defaults
-│   ├── dataproc/                    # Data loading and preprocessing
-│   │   ├── __init__.py
-│   │   ├── data_loader.py           # Dataloader for FITS or image stacks
-│   │   └── data_preprocessor.py     # Centering, scaling, and cropping routines
-│   └── utils/                       # Utility functions and helpers
-│       ├── __init__.py
-│       ├── image_plot.py            # Plotting routines for results
-│       ├── logging_utils.py         # Setup for structured logging
-│       ├── metrics_renderer.py      # metric computations
-│       ├── profiler.py              # Timing and performance profiling
-│       └── snr.py                   # Signal-to-noise ratio calculations
-└── tests/                           # Unit tests
-```
+
+Each call returns a `(len(K), H, W)` tensor of derotated, combined residuals.
+See the [documentation](https://torchklip.readthedocs.io) for all options.
 
 ## Citation
 
@@ -156,4 +152,4 @@ URL = {https://doi.org/10.1117/12.3027407}}
 
 ## Acknowledgments
 
-Thanks the [Code/Astro Workshop](https://semaphorep.github.io/codeastro/) for providing valuable training in the development of open-source software packages
+We thank the [Code/Astro Workshop](https://semaphorep.github.io/codeastro/) for providing valuable training in the development of open-source software packages.

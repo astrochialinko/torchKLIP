@@ -8,13 +8,18 @@
 
 import os
 import sys
+from importlib.metadata import PackageNotFoundError, version as _version
 sys.path.insert(0, os.path.abspath('../../src/'))
 
 project = 'torchklip'
 copyright = '2025, Chia-Lin Ko'
 author = 'Chia-Lin Ko'
 root_doc = 'index'
-release = 'v0.1'
+try:
+    release = _version("torchklip")
+except PackageNotFoundError:
+    release = "unknown"
+version = ".".join(release.split(".")[:2])
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
@@ -25,6 +30,9 @@ extensions = ['sphinx.ext.autodoc',
               'sphinx.ext.napoleon',
               'sphinx.ext.autosummary',
               'sphinx.ext.intersphinx']
+
+# Napoleon (Google-style docstrings)
+napoleon_use_ivar = True
 
 # Automatically generate stub pages for any autosummary directives
 autosummary_generate = True

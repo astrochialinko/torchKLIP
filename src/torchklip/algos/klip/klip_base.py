@@ -458,9 +458,12 @@ def compute_residuals_hybrid(
             independent of the raw flux scale of each dataset.
 
     Returns:
-        * Default: Tensor ``(n_K, nk, ny, nx)`` of PSF-subtracted residuals.
-        * ``return_diagnostics=True``: ``(residuals, KLIPDiagnostics)`` where
-          *residuals* has the shape above.
+        PSF-subtracted residuals whose type depends on ``return_diagnostics``.
+
+        * By default, a tensor ``(n_K, nk, ny, nx)``.
+        * With ``return_diagnostics=True``, a tuple
+          ``(residuals, KLIPDiagnostics)`` where *residuals* has the shape
+          above.
 
     Raises:
         ValueError: If K_klip is invalid, or *method* is unrecognised, or
@@ -1046,10 +1049,13 @@ class TorchKLIP:
                 (``hybrid`` mode always normalises.)
 
         Returns:
-            * Default: 2D tensor ``(ny, nx)`` for single K, or 3D tensor
-              ``(len(K_klip), ny, nx)`` for multiple K values.
-            * ``return_diagnostics=True``: ``(result, KLIPDiagnostics)`` where
-              *result* has the same shape as above.
+            Combined residuals whose type depends on ``return_diagnostics``.
+
+            * By default, a 2D tensor ``(ny, nx)`` for a single K, or a 3D
+              tensor ``(len(K_klip), ny, nx)`` for multiple K values.
+            * With ``return_diagnostics=True``, a tuple
+              ``(result, KLIPDiagnostics)`` where *result* has the same shape
+              as above.
 
         Raises:
             NotImplementedError: If *mode* is not ``'adi'``, ``'rdi'``, or
